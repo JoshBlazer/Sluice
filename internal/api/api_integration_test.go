@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/sluice/internal/api"
 	"github.com/sluice/internal/queue"
 	"github.com/sluice/internal/ratelimit"
+	"github.com/sluice/internal/storage"
 	"github.com/sluice/internal/testutil"
 )
 
@@ -269,5 +271,60 @@ func TestMetricsEndpoint(t *testing.T) {
 	b, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(b), `sluice_http_request_duration_seconds_count{method="GET",path="/healthz",status="200"}`) {
 		t.Fatal("request duration metric not recorded for /healthz")
+	}
+}
+
+func TestRetryHistory(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	db := testutil.DB(t)
+	tn, key := testutil.Tenant(t, db, 0, 100)
+	_, otherKey := testutil.Tenant(t, db, 0, 100)
+
+	retried := testutil.InsertJob(t, db, tn.ID, "https://example.com", nil)
+	testutil.InsertJob(t, db, tn.ID, "https://example.com", nil) // never failed
+
+	// Two failed attempts, each promoted back to pending for the next one.
+	for i := 0; i < 2; i++ {
+		token := uuid.New()
+		ok, runID, err := storage.TryClaim(ctx, db, retried.ID, "w", token, time.Now().Add(time.Minute))
+		if err != nil || !ok {
+			t.Fatalf("claim %d: ok=%v err=%v", i, ok, err)
+		}
+		next := time.Now()
+		if err := storage.FailJob(ctx, db, retried.ID, runID, token, fmt.Sprintf("boom %d", i), &next); err != nil {
+			t.Fatal(err)
+		}
+		if err := storage.PromoteFailedToPending(ctx, db, retried.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, list := e.do("GET", "/v1/jobs?retried=true", key, nil)
+	jobs := list["jobs"].([]any)
+	if len(jobs) != 1 || jobs[0].(map[string]any)["id"] != retried.ID.String() {
+		t.Fatalf("retried=true returned %v, want only the retried job", jobs)
+	}
+	if code, _ := e.do("GET", "/v1/jobs?retried=maybe", key, nil); code != http.StatusBadRequest {
+		t.Fatalf("bad retried value: %d, want 400", code)
+	}
+
+	code, body := e.do("GET", "/v1/jobs/"+retried.ID.String()+"/runs", key, nil)
+	if code != http.StatusOK {
+		t.Fatalf("runs: %d %v", code, body)
+	}
+	runs := body["runs"].([]any)
+	if len(runs) != 2 {
+		t.Fatalf("runs = %d, want 2", len(runs))
+	}
+	for i, r := range runs {
+		run := r.(map[string]any)
+		if int(run["attempt"].(float64)) != i || run["state"] != "failed" || run["error"] != fmt.Sprintf("boom %d", i) {
+			t.Fatalf("run %d = %v, want attempt %d failed with 'boom %d'", i, run, i, i)
+		}
+	}
+
+	if code, _ := e.do("GET", "/v1/jobs/"+retried.ID.String()+"/runs", otherKey, nil); code != http.StatusNotFound {
+		t.Fatalf("other tenant reading runs: %d, want 404", code)
 	}
 }

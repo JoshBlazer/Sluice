@@ -393,8 +393,10 @@ func MoveToDeadLetter(ctx context.Context, db *pgxpool.Pool, limit int) (int64, 
 type ListFilter struct {
 	TenantID *uuid.UUID
 	State    *job.State
-	Limit    int
-	Offset   int
+	// Retried limits results to jobs with at least one failed attempt.
+	Retried bool
+	Limit   int
+	Offset  int
 }
 
 func ListJobs(ctx context.Context, db *pgxpool.Pool, f ListFilter) ([]*job.Job, error) {
@@ -409,9 +411,10 @@ func ListJobs(ctx context.Context, db *pgxpool.Pool, f ListFilter) ([]*job.Job, 
 		FROM jobs
 		WHERE ($1::uuid IS NULL OR tenant_id = $1)
 		  AND ($2::job_state IS NULL OR state = $2)
+		  AND (NOT $5 OR attempt > 0)
 		ORDER BY created_at DESC
 		LIMIT $3 OFFSET $4`,
-		f.TenantID, statePtr(f.State), f.Limit, f.Offset)
+		f.TenantID, statePtr(f.State), f.Limit, f.Offset, f.Retried)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
@@ -830,8 +833,28 @@ func ListRecentRuns(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UUID, l
 	if err != nil {
 		return nil, fmt.Errorf("list recent runs: %w", err)
 	}
+	return collectRuns(rows)
+}
+
+// ListJobRuns returns every execution attempt of one job, oldest first. It returns
+// an empty list, not an error, for a job the tenant doesn't own.
+func ListJobRuns(ctx context.Context, db *pgxpool.Pool, jobID, tenantID uuid.UUID) ([]*JobRun, error) {
+	rows, err := db.Query(ctx, `
+		SELECT jr.id, jr.job_id, jr.tenant_id, j.type, jr.attempt,
+		       jr.state::text, jr.duration_ms, jr.started_at, jr.finished_at, jr.error
+		FROM job_runs jr
+		JOIN jobs j ON j.id = jr.job_id
+		WHERE jr.job_id = $1 AND jr.tenant_id = $2
+		ORDER BY jr.started_at`, jobID, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list job runs %s: %w", jobID, err)
+	}
+	return collectRuns(rows)
+}
+
+func collectRuns(rows pgx.Rows) ([]*JobRun, error) {
 	defer rows.Close()
-	var out []*JobRun
+	out := []*JobRun{}
 	for rows.Next() {
 		var r JobRun
 		if err := rows.Scan(&r.RunID, &r.JobID, &r.TenantID, &r.JobType, &r.Attempt,

@@ -58,5 +58,28 @@ export const fetchDeadLetter = (limit = 50) =>
     `/v1/stats/dead-letter?limit=${limit}`
   );
 
+export type Job = {
+  id: string;
+  tenant_id: string;
+  type: string;
+  priority: number;
+  state: string;
+  run_at: string;
+  attempt: number;
+  max_retries: number;
+  backoff_seconds: number;
+  last_error?: string;
+  created_at: string;
+  completed_at?: string;
+};
+
+export const fetchRetriedJobs = (state = "", limit = 100) =>
+  apiFetch<{ jobs: Job[] | null; count: number }>(
+    `/v1/jobs?retried=true&limit=${limit}${state ? `&state=${state}` : ""}`
+  );
+
+export const fetchJobRuns = (jobId: string) =>
+  apiFetch<{ runs: JobRun[]; count: number }>(`/v1/jobs/${jobId}/runs`);
+
 export const replayJob = (jobId: string) =>
   apiFetch<unknown>(`/v1/jobs/${jobId}/replay`, { method: "POST" });

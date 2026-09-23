@@ -158,7 +158,7 @@ Full design and trade-offs are documented in [architecture.md](architecture.md).
 - **Metrics**: queue depth, processing latency histogram, retry counts, worker health, throughput per tenant
 - **Tracing**: distributed traces from API submission to job completion via OpenTelemetry + Jaeger
 - **Logs**: structured JSON via `log/slog` with correlation IDs threaded through context
-- **Dashboard**: real-time queue depth, recent runs, dead-letter inspection, scoped to the API key it runs with
+- **Dashboard**: real-time queue depth, recent runs, retry histories (per-job attempt timelines), dead-letter inspection, scoped to the API key it runs with
 
 ### Operations
 

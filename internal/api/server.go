@@ -49,6 +49,7 @@ func New(db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter, port int)
 		r.Post("/jobs", s.handleSubmitJob)
 		r.Get("/jobs", s.handleListJobs)
 		r.Get("/jobs/{id}", s.handleGetJob)
+		r.Get("/jobs/{id}/runs", s.handleListJobRuns)
 		r.Post("/jobs/{id}/cancel", s.handleCancelJob)
 		r.Post("/jobs/{id}/replay", s.handleReplayJob)
 
