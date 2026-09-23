@@ -26,20 +26,26 @@ const (
 	recordTimeout     = 10 * time.Second
 )
 
+const DefaultConcurrency = 10
+
 type Options struct {
+	// Concurrency is how many jobs this worker executes at once. Zero means
+	// DefaultConcurrency.
+	Concurrency int
 	// AllowPrivateWebhooks lets webhook jobs reach loopback and private-network
 	// addresses. Only for local development and tests.
 	AllowPrivateWebhooks bool
 }
 
 type Worker struct {
-	id       string
-	db       *pgxpool.Pool
-	queue    *queue.Queue
-	http     *http.Client
-	shutdown chan struct{}
-	done     chan struct{}
-	reload   chan struct{}
+	id          string
+	concurrency int
+	db          *pgxpool.Pool
+	queue       *queue.Queue
+	http        *http.Client
+	shutdown    chan struct{}
+	done        chan struct{}
+	reload      chan struct{}
 
 	// execCtx scopes job execution. It is independent of Run's ctx so a SIGTERM
 	// drains in-flight work; abort cancels it once the drain timeout expires.
@@ -52,16 +58,21 @@ type Worker struct {
 
 func New(db *pgxpool.Pool, q *queue.Queue, opts Options) *Worker {
 	execCtx, abort := context.WithCancel(context.Background())
+	concurrency := opts.Concurrency
+	if concurrency <= 0 {
+		concurrency = DefaultConcurrency
+	}
 	return &Worker{
-		id:       uuid.NewString(),
-		db:       db,
-		queue:    q,
-		http:     newWebhookClient(opts.AllowPrivateWebhooks),
-		shutdown: make(chan struct{}),
-		done:     make(chan struct{}),
-		reload:   make(chan struct{}, 1),
-		execCtx:  execCtx,
-		abort:    abort,
+		id:          uuid.NewString(),
+		concurrency: concurrency,
+		db:          db,
+		queue:       q,
+		http:        newWebhookClient(opts.AllowPrivateWebhooks),
+		shutdown:    make(chan struct{}),
+		done:        make(chan struct{}),
+		reload:      make(chan struct{}, 1),
+		execCtx:     execCtx,
+		abort:       abort,
 	}
 }
 
@@ -110,6 +121,21 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 	}()
 
+	var wg sync.WaitGroup
+	for i := 0; i < w.concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.loop(pollCtx)
+		}()
+	}
+	wg.Wait()
+	slog.Info("worker stopped", "worker_id", w.id)
+}
+
+// loop pulls and executes one job at a time until pollCtx ends. Run starts
+// Concurrency of these.
+func (w *Worker) loop(pollCtx context.Context) {
 	for pollCtx.Err() == nil {
 		w.tenantsMu.RLock()
 		tenants := w.tenants
@@ -118,7 +144,7 @@ func (w *Worker) Run(ctx context.Context) {
 		jobID, err := w.queue.Dequeue(pollCtx, w.id, tenants, dequeueTimeout)
 		if err != nil {
 			if pollCtx.Err() != nil {
-				break
+				return
 			}
 			slog.Error("dequeue failed", "err", err)
 			// Redis is unreachable or erroring; back off rather than spin.
@@ -134,11 +160,10 @@ func (w *Worker) Run(ctx context.Context) {
 
 		w.process(w.execCtx, jobID)
 	}
-	slog.Info("worker stopped", "worker_id", w.id)
 }
 
-// Shutdown stops dequeuing and waits up to timeout for the in-flight job to
-// finish. If it doesn't, the job is aborted and recorded as a failed attempt.
+// Shutdown stops dequeuing and waits up to timeout for in-flight jobs to
+// finish. Any still running are aborted and recorded as failed attempts.
 func (w *Worker) Shutdown(timeout time.Duration) {
 	close(w.shutdown)
 	select {
@@ -146,12 +171,12 @@ func (w *Worker) Shutdown(timeout time.Duration) {
 		return
 	case <-time.After(timeout):
 	}
-	slog.Warn("worker shutdown timeout — aborting in-flight job")
+	slog.Warn("worker shutdown timeout — aborting in-flight jobs")
 	w.abort()
 	select {
 	case <-w.done:
 	case <-time.After(recordTimeout):
-		slog.Warn("in-flight job did not stop — the scheduler will requeue it after its deadline")
+		slog.Warn("in-flight jobs did not stop — the scheduler will requeue them after their deadlines")
 	}
 }
 

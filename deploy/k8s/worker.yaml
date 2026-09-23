@@ -19,7 +19,7 @@ spec:
       containers:
         - name: worker
           image: sluice:latest
-          args: ["--role", "worker", "--shutdown-timeout", "45s"]
+          args: ["--role", "worker", "--shutdown-timeout", "45s", "--concurrency", "10"]
           envFrom:
             - configMapRef:
                 name: sluice-config

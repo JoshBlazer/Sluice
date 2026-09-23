@@ -258,6 +258,25 @@ func cmdDrain(ctx context.Context, rdb *redis.Client) {
 		}
 	}
 
+	// Clear "already queued" markers too, or the reconciler couldn't re-enqueue the
+	// drained jobs until the markers expired.
+	cursor = 0
+	for {
+		keys, next, err := rdb.Scan(ctx, cursor, queue.EnqueuedPattern, 500).Result()
+		if err != nil {
+			fatalf("scan redis: %v", err)
+		}
+		if len(keys) > 0 {
+			if err := rdb.Del(ctx, keys...).Err(); err != nil {
+				fmt.Fprintf(os.Stderr, "warn: del enqueued markers: %v\n", err)
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+
 	if totalJobs == 0 {
 		fmt.Println("queues already empty")
 		return

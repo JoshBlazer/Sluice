@@ -183,3 +183,33 @@ func TestExportQueueDepths(t *testing.T) {
 		t.Fatalf("sluice_queue_depth{priority=high} = %v, want 4", got)
 	}
 }
+
+// Under a backlog, the pending reconciler must not pile duplicate entries into
+// Redis for jobs that are still waiting there.
+func TestReconcilePending_NoDuplicatesUnderBacklog(t *testing.T) {
+	ctx := context.Background()
+	db := testutil.DB(t)
+	q := queue.New(testutil.Redis(t))
+	tn, _ := testutil.Tenant(t, db, 0, 100)
+	s := New(db, q)
+
+	const n = 5
+	for i := 0; i < n; i++ {
+		j := testutil.InsertJob(t, db, tn.ID, "https://example.com", func(j *job.Job) {
+			j.RunAt = time.Now().Add(-5 * time.Minute) // waiting long enough to look "lost"
+		})
+		q.Enqueue(ctx, tn.ID, j.ID, j.Priority)
+	}
+	for i := 0; i < 3; i++ {
+		s.reconcilePending(ctx)
+	}
+
+	depths, _ := q.Depths(ctx, []uuid.UUID{tn.ID})
+	var total int64
+	for _, d := range depths {
+		total += d.Depth
+	}
+	if total != n {
+		t.Fatalf("queue holds %d entries for %d waiting jobs after 3 reconcile passes, want %d", total, n, n)
+	}
+}

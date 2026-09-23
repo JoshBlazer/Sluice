@@ -16,7 +16,13 @@ const (
 	HeartbeatTTL     = 15 * time.Second
 	processingPrefix = "processing:"
 	heartbeatPrefix  = "heartbeat:"
+	// enqueued:{job_id} marks a job as waiting in some queue list.
+	enqueuedPrefix = "enqueued:"
 )
+
+// EnqueuedPattern matches every job's "already queued" marker, for tools that
+// flush the queues and must clear markers along with them.
+const EnqueuedPattern = enqueuedPrefix + "*"
 
 // Priority bucket names. Queue keys are "{bucket}:{tenantID}".
 var priorityBuckets = []string{"queue:1", "queue:5", "queue:10"}
@@ -51,10 +57,30 @@ func NewClient(addr string) *redis.Client {
 	return redis.NewClient(&redis.Options{Addr: addr})
 }
 
-// Enqueue pushes a job to the tenant-scoped priority queue.
+// EnqueuedTTL bounds how long a job's "already queued" marker lives. It is the
+// longest a crash between a worker's pop and its marker delete can delay the
+// scheduler's re-enqueue of that job, and, under a backlog older than this, the
+// most often a still-waiting job can gain a (harmless) duplicate entry.
+const EnqueuedTTL = 10 * time.Minute
+
+// enqueueScript pushes the job only if its marker was newly set, so every
+// re-enqueue path (API, scheduler, reconciler, reaper) is idempotent while the
+// job is still waiting in Redis.
+var enqueueScript = redis.NewScript(`
+if redis.call('SET', KEYS[2], '1', 'NX', 'EX', ARGV[2]) then
+  redis.call('LPUSH', KEYS[1], ARGV[1])
+  return 1
+end
+return 0
+`)
+
+// Enqueue pushes a job to the tenant-scoped priority queue. It is a no-op if the
+// job is already waiting there.
 func (q *Queue) Enqueue(ctx context.Context, tenantID uuid.UUID, jobID uuid.UUID, priority int16) error {
 	key := bucketForPriority(priority) + ":" + tenantID.String()
-	if err := q.rdb.LPush(ctx, key, jobID.String()).Err(); err != nil {
+	err := enqueueScript.Run(ctx, q.rdb, []string{key, enqueuedPrefix + jobID.String()},
+		jobID.String(), int(EnqueuedTTL.Seconds())).Err()
+	if err != nil {
 		return fmt.Errorf("enqueue job %s to %s: %w", jobID, key, err)
 	}
 	return nil
@@ -102,12 +128,14 @@ func (q *Queue) Dequeue(ctx context.Context, workerID string, tenants []TenantWe
 		return uuid.Nil, fmt.Errorf("malformed job id %q in queue: %w", vals[0], err)
 	}
 
-	// The processing list only aids debugging: ownership and recovery are driven by
-	// Postgres claims, and a job lost between the pop and this push is re-enqueued by
-	// the scheduler's pending reconciler. The TTL stops lists of crashed workers
-	// accumulating forever.
+	// Clearing the marker lets the job be enqueued again (e.g. after a failed claim or
+	// a retry). The processing list only aids debugging: ownership and recovery are
+	// driven by Postgres claims, and a job lost between the pop and this pipeline is
+	// re-enqueued by the scheduler's pending reconciler once its marker expires. The
+	// TTL stops lists of crashed workers accumulating forever.
 	dest := processingPrefix + workerID
 	pipe := q.rdb.Pipeline()
+	pipe.Del(ctx, enqueuedPrefix+id.String())
 	pipe.LPush(ctx, dest, id.String())
 	pipe.Expire(ctx, dest, processingTTL)
 	if _, err := pipe.Exec(ctx); err != nil {

@@ -283,6 +283,9 @@ Hardening pass (2026-09-23):
 - Webhooks refuse non-public addresses unless SLUICE_WEBHOOK_ALLOW_PRIVATE=true (dev/tests)
 - Cancel sets state 'cancelled' (migration 6) instead of deleting
 - Scheduler leader exports sluice_queue_depth; KEDA scales workers on it
+- Workers run --concurrency jobs at once (default 10); dequeue blocks on BLMPOP
+- Enqueue is idempotent via an enqueued:{job_id} marker (TTL queue.EnqueuedTTL), so
+  reconciler/reaper re-enqueues don't duplicate waiting jobs; `sluice-cli drain` clears markers too
 
 Dev notes:
 - Postgres runs on port 5433 (native Postgres occupies 5432 on this machine)

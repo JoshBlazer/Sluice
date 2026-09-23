@@ -34,6 +34,7 @@ type config struct {
 	metricsPort     int
 	shutdownTimeout time.Duration
 	webhookPrivate  bool
+	concurrency     int
 }
 
 func loadConfig() config {
@@ -46,6 +47,7 @@ func loadConfig() config {
 	flag.IntVar(&c.httpPort, "port", envInt("SLUICE_PORT", 8080), "http port (api role only)")
 	flag.IntVar(&c.metricsPort, "metrics-port", envInt("SLUICE_METRICS_PORT", 0), "prometheus metrics port (scheduler=9091, worker=9092 by default)")
 	flag.DurationVar(&c.shutdownTimeout, "shutdown-timeout", 30*time.Second, "graceful shutdown timeout")
+	flag.IntVar(&c.concurrency, "concurrency", envInt("SLUICE_WORKER_CONCURRENCY", worker.DefaultConcurrency), "jobs a worker runs at once (worker role only)")
 	flag.BoolVar(&c.webhookPrivate, "webhook-allow-private", env("SLUICE_WEBHOOK_ALLOW_PRIVATE", "") == "true", "let webhook jobs call loopback/private addresses (local dev only)")
 	flag.Parse()
 	return c
@@ -57,6 +59,10 @@ func main() {
 	})))
 
 	c := loadConfig()
+	if c.concurrency < 1 {
+		fmt.Fprintln(os.Stderr, "--concurrency must be at least 1")
+		os.Exit(1)
+	}
 	switch c.role {
 	case "api", "scheduler", "worker":
 	case "":
@@ -78,7 +84,12 @@ func main() {
 		defer otelShutdown(context.Background()) //nolint:errcheck
 	}
 
-	db, err := storage.NewPool(ctx, c.postgresURL)
+	var minConns int32
+	if c.role == "worker" {
+		// One connection per concurrent job, plus headroom for heartbeats and tenant reloads.
+		minConns = int32(c.concurrency) + 4
+	}
+	db, err := storage.NewPool(ctx, c.postgresURL, minConns)
 	if err != nil {
 		slog.Error("connect to postgres", "err", err)
 		os.Exit(1)
@@ -165,7 +176,7 @@ func runScheduler(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queu
 }
 
 func runWorker(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queue) {
-	w := worker.New(db, q, worker.Options{AllowPrivateWebhooks: c.webhookPrivate})
+	w := worker.New(db, q, worker.Options{Concurrency: c.concurrency, AllowPrivateWebhooks: c.webhookPrivate})
 	if c.webhookPrivate {
 		slog.Warn("webhook jobs may call private and loopback addresses — do not use in production")
 	}
