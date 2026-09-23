@@ -3,10 +3,15 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sluice/internal/metrics"
 	"github.com/sluice/internal/storage"
 	"github.com/sluice/internal/telemetry"
 	"github.com/sluice/internal/tenant"
@@ -73,4 +78,21 @@ func extractBearerToken(r *http.Request) string {
 		return ""
 	}
 	return strings.TrimSpace(parts[1])
+}
+
+// metricsMiddleware records sluice_http_request_duration_seconds, labelled by the
+// matched route pattern (not the raw path) to keep label cardinality bounded.
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		next.ServeHTTP(ww, r)
+		pattern := chi.RouteContext(r.Context()).RoutePattern()
+		if pattern == "" {
+			pattern = "unmatched"
+		}
+		metrics.HTTPRequestDuration.
+			WithLabelValues(r.Method, pattern, strconv.Itoa(ww.Status())).
+			Observe(time.Since(start).Seconds())
+	})
 }

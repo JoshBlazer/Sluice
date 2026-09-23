@@ -1,10 +1,10 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: Sluice-config
-  namespace: Sluice
+  name: sluice-config
+  namespace: sluice
 data:
-  Sluice_POSTGRES_URL: "postgres://Sluice:Sluice@postgres:5432/Sluice?sslmode=disable"
-  Sluice_REDIS_ADDR: "redis:6379"
-  Sluice_ETCD_ENDPOINTS: "etcd:2379"
-  Sluice_PORT: "8080"
+  SLUICE_POSTGRES_URL: "postgres://sluice:sluice@postgres:5432/sluice?sslmode=disable"
+  SLUICE_REDIS_ADDR: "redis:6379"
+  SLUICE_ETCD_ENDPOINTS: "etcd:2379"
+  SLUICE_PORT: "8080"

@@ -271,8 +271,18 @@ Phase 3 - High Availability:  [x] COMPLETE — etcd leader election, weighted fa
 Phase 4 - Observability:      [x] COMPLETE — Prometheus (3/3 targets up), Jaeger traces (sluice-api + sluice-worker), Next.js dashboard live at :3030
 ```
 
-Last worked on: 2026-06-01
-Next task: All phases complete. Optional: production hardening, WASM job types, DAG support (see README roadmap).
+Last worked on: 2026-09-23
+Next task: All phases complete. Hardening pass done on branch `hardening` (see below). Optional: WASM job types, DAG support (see README roadmap).
+
+Hardening pass (2026-09-23):
+- Finished the Pulse→Sluice rename: Dockerfile, Helm helpers, K8s names (lowercase), env prefix is SLUICE_ (uppercase; Linux is case-sensitive)
+- max_retries = retries after the first attempt (max_retries=3 → 4 executions); first retry waits backoff_seconds
+- Workers drain in-flight jobs on SIGTERM; --shutdown-timeout aborts and records the attempt
+- Stats/WebSocket endpoints are tenant-scoped; /ws authenticates via ?token=
+- API keys stored as SHA-256 (migration 7); create/rotate via sluice-cli
+- Webhooks refuse non-public addresses unless SLUICE_WEBHOOK_ALLOW_PRIVATE=true (dev/tests)
+- Cancel sets state 'cancelled' (migration 6) instead of deleting
+- Scheduler leader exports sluice_queue_depth; KEDA scales workers on it
 
 Dev notes:
 - Postgres runs on port 5433 (native Postgres occupies 5432 on this machine)
@@ -283,5 +293,7 @@ Dev notes:
 - migrate URL format: pgx5://sluice:sluice@localhost:5433/sluice?sslmode=disable
 - etcd runs on port 2379 (quay.io/coreos/etcd:v3.5.16), single-node for local dev
 - Queue keys are now per-tenant: queue:{priority}:{tenantID} — flush Redis when switching from Phase 2 data
-- Split-brain test: go test -tags integration ./internal/storage/... -run TestTryClaim_SkipLocked (needs Docker stack running)
+- Integration tests: make test-integration (needs Docker stack + migrations; uses Redis DB 15 and throwaway tenants)
+- Race detector on Windows: run the tests in a golang:1.25 container pointed at host.docker.internal (SLUICE_TEST_POSTGRES_URL / SLUICE_TEST_REDIS_ADDR)
+- Load test: scripts/loadtest (see README "Load testing")
 - SIGHUP reloads tenant weights in worker: kill -SIGHUP <worker-pid> or Send-Signal on Windows

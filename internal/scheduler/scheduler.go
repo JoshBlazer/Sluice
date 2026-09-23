@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -10,27 +11,31 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/robfig/cron/v3"
 	"github.com/sluice/internal/job"
 	"github.com/sluice/internal/leader"
 	"github.com/sluice/internal/metrics"
 	"github.com/sluice/internal/queue"
 	"github.com/sluice/internal/storage"
-	"github.com/robfig/cron/v3"
 )
 
 const (
-	duePollInterval             = 100 * time.Millisecond
-	staleReapInterval           = 5 * time.Second
-	deadLetterInterval          = 30 * time.Second
-	cronInterval                = 60 * time.Second
-	pendingReconcileInterval    = 30 * time.Second
-	partitionMaintainInterval   = 24 * time.Hour
-	duePollBatchSize            = 500
-	failedPollBatchSize         = 500
-	cronBatchSize               = 200
-	pendingReconcileBatchSize   = 500
-	partitionLookaheadMonths    = 3
+	duePollInterval           = 100 * time.Millisecond
+	staleReapInterval         = 5 * time.Second
+	deadLetterInterval        = 30 * time.Second
+	cronInterval              = 60 * time.Second
+	pendingReconcileInterval  = 30 * time.Second
+	partitionMaintainInterval = 24 * time.Hour
+	duePollBatchSize          = 500
+	failedPollBatchSize       = 500
+	cronBatchSize             = 200
+	pendingReconcileBatchSize = 500
+	partitionLookaheadMonths  = 3
+	deadLetterBatchSize       = 500
+	queueDepthInterval        = 5 * time.Second
 )
+
+var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
 type Scheduler struct {
 	db    *pgxpool.Pool
@@ -56,28 +61,32 @@ func (s *Scheduler) Run(ctx context.Context, elect *leader.Election) {
 		}
 		slog.Info("scheduler became leader")
 		metrics.SchedulerIsLeader.Set(1)
-
-		var wg sync.WaitGroup
-		for _, fn := range []func(context.Context){
-			s.runDuePoll,
-			s.runStaleReaper,
-			s.runDeadLetterPromoter,
-			s.runCronExpander,
-			s.runPendingReconciler,
-			s.runPartitionMaintainer,
-		} {
-			wg.Add(1)
-			go func(f func(context.Context)) {
-				defer wg.Done()
-				f(leaderCtx)
-			}(fn)
-		}
-
-		wg.Wait()
+		s.lead(leaderCtx)
 		metrics.SchedulerIsLeader.Set(0)
 		resign()
 		slog.Info("scheduler lost leadership — re-entering election")
 	}
+}
+
+// lead runs every scheduler loop until ctx (the leadership lease) ends.
+func (s *Scheduler) lead(ctx context.Context) {
+	var wg sync.WaitGroup
+	for _, fn := range []func(context.Context){
+		s.runDuePoll,
+		s.runStaleReaper,
+		s.runDeadLetterPromoter,
+		s.runCronExpander,
+		s.runPendingReconciler,
+		s.runPartitionMaintainer,
+		s.runQueueDepthExporter,
+	} {
+		wg.Add(1)
+		go func(f func(context.Context)) {
+			defer wg.Done()
+			f(ctx)
+		}(fn)
+	}
+	wg.Wait()
 }
 
 func (s *Scheduler) runDuePoll(ctx context.Context) {
@@ -176,16 +185,55 @@ func (s *Scheduler) runDeadLetterPromoter(ctx context.Context) {
 }
 
 func (s *Scheduler) promoteDeadJobs(ctx context.Context) {
-	deadState := storage.DeadState()
-	jobs, err := storage.ListJobs(ctx, s.db, storage.ListFilter{State: deadState, Limit: 200})
+	for ctx.Err() == nil {
+		n, err := storage.MoveToDeadLetter(ctx, s.db, deadLetterBatchSize)
+		if err != nil {
+			slog.Error("move to dead letter", "err", err)
+			return
+		}
+		if n > 0 {
+			slog.Info("moved jobs to dead letter", "count", n)
+		}
+		if n < deadLetterBatchSize {
+			return
+		}
+	}
+}
+
+func (s *Scheduler) runQueueDepthExporter(ctx context.Context) {
+	defer metrics.QueueDepth.Reset()
+	ticker := time.NewTicker(queueDepthInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.exportQueueDepths(ctx)
+		}
+	}
+}
+
+// exportQueueDepths publishes sluice_queue_depth. Only the leader exports it, so
+// sum(sluice_queue_depth) across all scheduler pods is the true total.
+func (s *Scheduler) exportQueueDepths(ctx context.Context) {
+	tenants, err := storage.GetTenants(ctx, s.db)
 	if err != nil {
-		slog.Error("list dead jobs", "err", err)
+		slog.Error("queue depth: load tenants", "err", err)
 		return
 	}
-	for _, j := range jobs {
-		if err := storage.MoveToDeadLetter(ctx, s.db, j.ID); err != nil {
-			slog.Error("move to dead letter", "job_id", j.ID, "err", err)
-		}
+	ids := make([]uuid.UUID, len(tenants))
+	for i, t := range tenants {
+		ids[i] = t.ID
+	}
+	depths, err := s.queue.Depths(ctx, ids)
+	if err != nil {
+		slog.Error("queue depth: read redis", "err", err)
+		return
+	}
+	metrics.QueueDepth.Reset()
+	for _, d := range depths {
+		metrics.QueueDepth.WithLabelValues(d.Priority, d.TenantID.String()).Set(float64(d.Depth))
 	}
 }
 
@@ -274,63 +322,44 @@ func (s *Scheduler) expandCron(ctx context.Context) {
 }
 
 func (s *Scheduler) fireSchedule(ctx context.Context, sched *storage.Schedule) error {
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	expr, err := parser.Parse(sched.Cron)
+	expr, err := cronParser.Parse(sched.Cron)
 	if err != nil {
 		return fmt.Errorf("parse cron %q: %w", sched.Cron, err)
 	}
+	loc, err := time.LoadLocation(sched.Timezone)
+	if err != nil {
+		return fmt.Errorf("load timezone %q: %w", sched.Timezone, err)
+	}
 
 	now := time.Now()
-	nextRunAt := expr.Next(now)
+	nextRunAt := expr.Next(now.In(loc))
 
-	var template struct {
-		Type           string          `json:"type"`
-		Payload        json.RawMessage `json:"payload"`
-		Priority       *int16          `json:"priority,omitempty"`
-		MaxRetries     *int            `json:"max_retries,omitempty"`
-		BackoffSeconds *int            `json:"backoff_seconds,omitempty"`
-	}
+	var template job.Template
 	if err := json.Unmarshal(sched.JobTemplate, &template); err != nil {
 		return fmt.Errorf("unmarshal job template: %w", err)
 	}
+	j, err := template.Build(sched.TenantID, now)
+	if err != nil {
+		return fmt.Errorf("invalid job template: %w", err)
+	}
+	// Keyed on the occurrence being fired, so if updating next_run_at below fails
+	// and the schedule is picked up again, the duplicate insert is a no-op.
+	key := fmt.Sprintf("schedule:%s:%d", sched.ID, sched.NextRunAt.Unix())
+	j.IdempotencyKey = &key
 
-	priority := job.PriorityNormal
-	if template.Priority != nil {
-		priority = *template.Priority
-	}
-	maxRetries := 3
-	if template.MaxRetries != nil {
-		maxRetries = *template.MaxRetries
-	}
-	backoff := 30
-	if template.BackoffSeconds != nil {
-		backoff = *template.BackoffSeconds
-	}
-
-	j := &job.Job{
-		ID:             uuid.New(),
-		TenantID:       sched.TenantID,
-		Type:           template.Type,
-		Payload:        template.Payload,
-		Priority:       priority,
-		State:          job.StatePending,
-		RunAt:          now,
-		Attempt:        0,
-		MaxRetries:     maxRetries,
-		BackoffSeconds: backoff,
-		CreatedAt:      now,
-	}
-
-	if err := storage.InsertJob(ctx, s.db, j); err != nil {
+	switch err := storage.InsertJob(ctx, s.db, j); {
+	case errors.Is(err, storage.ErrDuplicate):
+		slog.Info("cron occurrence already fired", "schedule", sched.Name, "occurrence", sched.NextRunAt)
+	case err != nil:
 		return fmt.Errorf("insert cron job: %w", err)
-	}
-	if err := s.queue.Enqueue(ctx, j.TenantID, j.ID, j.Priority); err != nil {
-		slog.Warn("enqueue cron job failed — job is durable in postgres", "job_id", j.ID, "err", err)
+	default:
+		if err := s.queue.Enqueue(ctx, j.TenantID, j.ID, j.Priority); err != nil {
+			slog.Warn("enqueue cron job failed — job is durable in postgres", "job_id", j.ID, "err", err)
+		}
+		slog.Info("fired cron schedule", "schedule", sched.Name, "job_id", j.ID, "next_run_at", nextRunAt)
 	}
 	if err := storage.UpdateScheduleAfterRun(ctx, s.db, sched.ID, now, nextRunAt); err != nil {
 		return fmt.Errorf("update schedule next_run_at: %w", err)
 	}
-
-	slog.Info("fired cron schedule", "schedule", sched.Name, "job_id", j.ID, "next_run_at", nextRunAt)
 	return nil
 }

@@ -1,29 +1,29 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: Sluice-api
-  namespace: Sluice
+  name: sluice-api
+  namespace: sluice
   labels:
-    app: Sluice-api
+    app: sluice-api
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: Sluice-api
+      app: sluice-api
   template:
     metadata:
       labels:
-        app: Sluice-api
+        app: sluice-api
     spec:
       containers:
         - name: api
-          image: Sluice:latest
+          image: sluice:latest
           args: ["--role", "api"]
           ports:
             - containerPort: 8080
           envFrom:
             - configMapRef:
-                name: Sluice-config
+                name: sluice-config
           readinessProbe:
             httpGet:
               path: /healthz
@@ -47,11 +47,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: Sluice-api
-  namespace: Sluice
+  name: sluice-api
+  namespace: sluice
 spec:
   selector:
-    app: Sluice-api
+    app: sluice-api
   ports:
     - port: 80
       targetPort: 8080

@@ -15,81 +15,53 @@ import (
 	"github.com/sluice/internal/tenant"
 )
 
+const maxIdempotencyKeyLen = 255
+
 type submitJobRequest struct {
-	Type           string          `json:"type"`
-	Payload        json.RawMessage `json:"payload"`
-	Priority       *int16          `json:"priority,omitempty"`
-	RunAt          *time.Time      `json:"run_at,omitempty"`
-	MaxRetries     *int            `json:"max_retries,omitempty"`
-	BackoffSeconds *int            `json:"backoff_seconds,omitempty"`
-	IdempotencyKey *string         `json:"idempotency_key,omitempty"`
+	job.Template
+	RunAt          *time.Time `json:"run_at,omitempty"`
+	IdempotencyKey *string    `json:"idempotency_key,omitempty"`
 }
 
 func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	t, _ := tenant.FromContext(r.Context())
 
 	var req submitJobRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Type == "" {
-		writeError(w, http.StatusBadRequest, "type is required")
-		return
-	}
-	if len(req.Payload) == 0 {
-		writeError(w, http.StatusBadRequest, "payload is required")
+	if req.IdempotencyKey != nil && (*req.IdempotencyKey == "" || len(*req.IdempotencyKey) > maxIdempotencyKeyLen) {
+		writeError(w, http.StatusBadRequest, "idempotency_key must be 1-255 characters")
 		return
 	}
 
-	// Rate limit check.
+	now := time.Now()
+	j, err := req.Template.Build(t.ID, now)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	j.IdempotencyKey = req.IdempotencyKey
+	if req.RunAt != nil && req.RunAt.After(now) {
+		j.RunAt = *req.RunAt
+		j.State = job.StateScheduled
+	}
+
 	if s.limiter != nil {
 		ok, err := s.limiter.Allow(r.Context(), t.ID, t.RateLimit)
 		if err != nil {
+			// Fail open: the job is still durably stored, and rejecting all traffic
+			// because Redis blipped is worse than briefly exceeding a quota.
 			slog.Error("rate limit check", "tenant_id", t.ID, "err", err)
 		} else if !ok {
+			w.Header().Set("Retry-After", "1")
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
 	}
 
-	priority := job.PriorityNormal
-	if req.Priority != nil {
-		priority = *req.Priority
-	}
-	maxRetries := 3
-	if req.MaxRetries != nil {
-		maxRetries = *req.MaxRetries
-	}
-	backoff := 30
-	if req.BackoffSeconds != nil {
-		backoff = *req.BackoffSeconds
-	}
-
-	now := time.Now()
-	runAt := now
-	state := job.StatePending
-	if req.RunAt != nil && req.RunAt.After(now) {
-		runAt = *req.RunAt
-		state = job.StateScheduled
-	}
-
-	j := &job.Job{
-		ID:             uuid.New(),
-		TenantID:       t.ID,
-		Type:           req.Type,
-		Payload:        req.Payload,
-		Priority:       priority,
-		State:          state,
-		RunAt:          runAt,
-		Attempt:        0,
-		MaxRetries:     maxRetries,
-		BackoffSeconds: backoff,
-		IdempotencyKey: req.IdempotencyKey,
-		CreatedAt:      now,
-	}
-
-	err := storage.InsertJob(r.Context(), s.db, j)
+	err = storage.InsertJob(r.Context(), s.db, j)
 	if errors.Is(err, storage.ErrDuplicate) {
 		// Idempotency key conflict — return the original job with 200.
 		if req.IdempotencyKey != nil {
@@ -108,7 +80,7 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if state == job.StatePending {
+	if j.State == job.StatePending {
 		if err := s.queue.Enqueue(r.Context(), j.TenantID, j.ID, j.Priority); err != nil {
 			slog.Error("enqueue job", "job_id", j.ID, "err", err)
 		}
@@ -143,6 +115,10 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 
 	if v := r.URL.Query().Get("state"); v != "" {
 		st := job.State(v)
+		if !st.Valid() {
+			writeError(w, http.StatusBadRequest, "unknown state "+strconv.Quote(v))
+			return
+		}
 		filter.State = &st
 	}
 	if v := r.URL.Query().Get("limit"); v != "" {

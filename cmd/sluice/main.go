@@ -22,7 +22,6 @@ import (
 	"github.com/sluice/internal/storage"
 	"github.com/sluice/internal/telemetry"
 	"github.com/sluice/internal/worker"
-	"github.com/redis/go-redis/v9"
 )
 
 type config struct {
@@ -34,18 +33,20 @@ type config struct {
 	httpPort        int
 	metricsPort     int
 	shutdownTimeout time.Duration
+	webhookPrivate  bool
 }
 
 func loadConfig() config {
 	var c config
-	flag.StringVar(&c.role, "role", env("sluice_ROLE", ""), "role to run: api | scheduler | worker")
-	flag.StringVar(&c.postgresURL, "postgres-url", env("sluice_POSTGRES_URL", "postgres://pulse:pulse@localhost:5433/pulse?sslmode=disable"), "postgres connection string")
-	flag.StringVar(&c.redisAddr, "redis-addr", env("sluice_REDIS_ADDR", "localhost:6379"), "redis address")
-	flag.StringVar(&c.etcdEndpoints, "etcd-endpoints", env("sluice_ETCD_ENDPOINTS", "localhost:2379"), "comma-separated etcd endpoints")
-	flag.StringVar(&c.otlpEndpoint, "otlp-endpoint", env("sluice_OTLP_ENDPOINT", "localhost:4318"), "OTLP HTTP trace endpoint")
-	flag.IntVar(&c.httpPort, "port", envInt("sluice_PORT", 8080), "http port (api role only)")
-	flag.IntVar(&c.metricsPort, "metrics-port", envInt("sluice_METRICS_PORT", 0), "prometheus metrics port (scheduler=9091, worker=9092 by default)")
+	flag.StringVar(&c.role, "role", env("SLUICE_ROLE", ""), "role to run: api | scheduler | worker")
+	flag.StringVar(&c.postgresURL, "postgres-url", env("SLUICE_POSTGRES_URL", "postgres://sluice:sluice@localhost:5433/sluice?sslmode=disable"), "postgres connection string")
+	flag.StringVar(&c.redisAddr, "redis-addr", env("SLUICE_REDIS_ADDR", "localhost:6379"), "redis address")
+	flag.StringVar(&c.etcdEndpoints, "etcd-endpoints", env("SLUICE_ETCD_ENDPOINTS", "localhost:2379"), "comma-separated etcd endpoints")
+	flag.StringVar(&c.otlpEndpoint, "otlp-endpoint", env("SLUICE_OTLP_ENDPOINT", "localhost:4318"), "OTLP HTTP trace endpoint")
+	flag.IntVar(&c.httpPort, "port", envInt("SLUICE_PORT", 8080), "http port (api role only)")
+	flag.IntVar(&c.metricsPort, "metrics-port", envInt("SLUICE_METRICS_PORT", 0), "prometheus metrics port (scheduler=9091, worker=9092 by default)")
 	flag.DurationVar(&c.shutdownTimeout, "shutdown-timeout", 30*time.Second, "graceful shutdown timeout")
+	flag.BoolVar(&c.webhookPrivate, "webhook-allow-private", env("SLUICE_WEBHOOK_ALLOW_PRIVATE", "") == "true", "let webhook jobs call loopback/private addresses (local dev only)")
 	flag.Parse()
 	return c
 }
@@ -56,8 +57,13 @@ func main() {
 	})))
 
 	c := loadConfig()
-	if c.role == "" {
-		fmt.Fprintln(os.Stderr, "usage: pulse --role <api|scheduler|worker>")
+	switch c.role {
+	case "api", "scheduler", "worker":
+	case "":
+		fmt.Fprintln(os.Stderr, "usage: sluice --role <api|scheduler|worker>")
+		os.Exit(1)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown role %q — must be api, scheduler, or worker\n", c.role)
 		os.Exit(1)
 	}
 
@@ -65,7 +71,7 @@ func main() {
 	defer stop()
 
 	// Initialise OTel tracing. Non-fatal if Jaeger is not available.
-	otelShutdown, err := telemetry.Init(ctx, "pulse-"+c.role, c.otlpEndpoint)
+	otelShutdown, err := telemetry.Init(ctx, "sluice-"+c.role, c.otlpEndpoint)
 	if err != nil {
 		slog.Warn("OTel init failed — tracing disabled", "err", err)
 	} else {
@@ -91,16 +97,13 @@ func main() {
 
 	switch c.role {
 	case "api":
-		runAPI(ctx, c, db, q, rdb, limiter)
+		runAPI(ctx, c, db, q, limiter)
 	case "scheduler":
 		startMetricsServer(c.metricsPort, 9091)
 		runScheduler(ctx, c, db, q)
 	case "worker":
 		startMetricsServer(c.metricsPort, 9092)
-		runWorker(ctx, c, db, q, rdb)
-	default:
-		fmt.Fprintf(os.Stderr, "unknown role %q — must be api, scheduler, or worker\n", c.role)
-		os.Exit(1)
+		runWorker(ctx, c, db, q)
 	}
 }
 
@@ -122,8 +125,8 @@ func startMetricsServer(port, defaultPort int) {
 	}()
 }
 
-func runAPI(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queue, rdb *redis.Client, limiter *ratelimit.Limiter) {
-	srv := api.New(db, q, rdb, limiter, c.httpPort)
+func runAPI(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter) {
+	srv := api.New(db, q, limiter, c.httpPort)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -156,14 +159,16 @@ func runScheduler(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queu
 	}
 	defer etcdClient.Close()
 
-	elect := leader.New(etcdClient, "/pulse/scheduler/leader", 5)
+	elect := leader.New(etcdClient, "/sluice/scheduler/leader", 5)
 	s := scheduler.New(db, q)
 	s.Run(ctx, elect)
 }
 
-func runWorker(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queue, rdb *redis.Client) {
-	_ = rdb // reserved for future worker-side Redis ops
-	w := worker.New(db, q)
+func runWorker(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queue) {
+	w := worker.New(db, q, worker.Options{AllowPrivateWebhooks: c.webhookPrivate})
+	if c.webhookPrivate {
+		slog.Warn("webhook jobs may call private and loopback addresses — do not use in production")
+	}
 	go w.Run(ctx)
 
 	sighupCh := make(chan os.Signal, 1)

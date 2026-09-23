@@ -1,12 +1,12 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "Sluice.fullname" . }}-config
+  name: {{ include "sluice.fullname" . }}-config
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "Sluice.labels" . | nindent 4 }}
+    {{- include "sluice.labels" . | nindent 4 }}
 data:
-  Sluice_POSTGRES_URL: {{ .Values.postgres.url | quote }}
-  Sluice_REDIS_ADDR: {{ .Values.redis.addr | quote }}
-  Sluice_ETCD_ENDPOINTS: {{ .Values.etcd.endpoints | quote }}
-  Sluice_PORT: {{ .Values.api.port | quote }}
+  SLUICE_POSTGRES_URL: {{ .Values.postgres.url | quote }}
+  SLUICE_REDIS_ADDR: {{ .Values.redis.addr | quote }}
+  SLUICE_ETCD_ENDPOINTS: {{ .Values.etcd.endpoints | quote }}
+  SLUICE_PORT: {{ .Values.api.port | quote }}

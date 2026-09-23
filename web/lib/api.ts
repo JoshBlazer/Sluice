@@ -1,10 +1,10 @@
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
-const TOKEN = process.env.NEXT_PUBLIC_API_TOKEN ?? "dev-token";
+export const API_TOKEN = process.env.NEXT_PUBLIC_API_TOKEN ?? "dev-token";
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: {
-      Authorization: `Bearer ${TOKEN}`,
+      Authorization: `Bearer ${API_TOKEN}`,
       "Content-Type": "application/json",
     },
     cache: "no-store",

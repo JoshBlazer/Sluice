@@ -1,10 +1,10 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "Sluice.fullname" . }}-scheduler
+  name: {{ include "sluice.fullname" . }}-scheduler
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "Sluice.labels" . | nindent 4 }}
+    {{- include "sluice.labels" . | nindent 4 }}
     app.kubernetes.io/component: scheduler
 spec:
   replicas: {{ .Values.scheduler.replicas }}
@@ -25,9 +25,9 @@ spec:
     spec:
       containers:
         - name: scheduler
-          image: {{ include "Sluice.image" . }}
+          image: {{ include "sluice.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["--role", "scheduler"]
-          {{- include "Sluice.envFrom" . | nindent 10 }}
+          {{- include "sluice.envFrom" . | nindent 10 }}
           resources:
             {{- toYaml .Values.scheduler.resources | nindent 12 }}

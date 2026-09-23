@@ -1,9 +1,7 @@
 package worker
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -22,33 +20,48 @@ import (
 )
 
 const (
-	dequeueTimeout    = 5 * time.Second
-	visibilityTimeout = 30 * time.Second
+	dequeueTimeout    = time.Second
 	heartbeatInterval = 5 * time.Second
-	httpTimeout       = 25 * time.Second
 	tenantRefresh     = 60 * time.Second
+	recordTimeout     = 10 * time.Second
 )
+
+type Options struct {
+	// AllowPrivateWebhooks lets webhook jobs reach loopback and private-network
+	// addresses. Only for local development and tests.
+	AllowPrivateWebhooks bool
+}
 
 type Worker struct {
 	id       string
 	db       *pgxpool.Pool
 	queue    *queue.Queue
+	http     *http.Client
 	shutdown chan struct{}
 	done     chan struct{}
 	reload   chan struct{}
+
+	// execCtx scopes job execution. It is independent of Run's ctx so a SIGTERM
+	// drains in-flight work; abort cancels it once the drain timeout expires.
+	execCtx context.Context
+	abort   context.CancelFunc
 
 	tenantsMu sync.RWMutex
 	tenants   []queue.TenantWeight
 }
 
-func New(db *pgxpool.Pool, q *queue.Queue) *Worker {
+func New(db *pgxpool.Pool, q *queue.Queue, opts Options) *Worker {
+	execCtx, abort := context.WithCancel(context.Background())
 	return &Worker{
 		id:       uuid.NewString(),
 		db:       db,
 		queue:    q,
+		http:     newWebhookClient(opts.AllowPrivateWebhooks),
 		shutdown: make(chan struct{}),
 		done:     make(chan struct{}),
 		reload:   make(chan struct{}, 1),
+		execCtx:  execCtx,
+		abort:    abort,
 	}
 }
 
@@ -61,11 +74,24 @@ func (w *Worker) Reload() {
 	}
 }
 
+// Run pulls and executes jobs until Shutdown is called or ctx is cancelled.
+// Cancelling ctx stops dequeuing but does not interrupt a running job; only
+// Shutdown's timeout does that, so a SIGTERM lets in-flight work finish.
 func (w *Worker) Run(ctx context.Context) {
 	defer close(w.done)
 	slog.Info("worker started", "worker_id", w.id)
 
-	w.loadTenants(ctx)
+	pollCtx, stopPolling := context.WithCancel(ctx)
+	defer stopPolling()
+	go func() {
+		select {
+		case <-w.shutdown:
+			stopPolling()
+		case <-pollCtx.Done():
+		}
+	}()
+
+	w.loadTenants(pollCtx)
 
 	// Background goroutine refreshes the tenant list periodically and on demand.
 	go func() {
@@ -73,53 +99,59 @@ func (w *Worker) Run(ctx context.Context) {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-pollCtx.Done():
 				return
 			case <-ticker.C:
-				w.loadTenants(ctx)
+				w.loadTenants(pollCtx)
 			case <-w.reload:
 				slog.Info("worker reloading tenant weights", "worker_id", w.id)
-				w.loadTenants(ctx)
+				w.loadTenants(pollCtx)
 			}
 		}
 	}()
 
-	for {
-		select {
-		case <-w.shutdown:
-			slog.Info("worker shutting down", "worker_id", w.id)
-			return
-		case <-ctx.Done():
-			return
-		default:
-		}
-
+	for pollCtx.Err() == nil {
 		w.tenantsMu.RLock()
 		tenants := w.tenants
 		w.tenantsMu.RUnlock()
 
-		jobID, err := w.queue.Dequeue(ctx, w.id, tenants, dequeueTimeout)
+		jobID, err := w.queue.Dequeue(pollCtx, w.id, tenants, dequeueTimeout)
 		if err != nil {
-			if ctx.Err() != nil {
-				return
+			if pollCtx.Err() != nil {
+				break
 			}
 			slog.Error("dequeue failed", "err", err)
+			// Redis is unreachable or erroring; back off rather than spin.
+			select {
+			case <-pollCtx.Done():
+			case <-time.After(time.Second):
+			}
 			continue
 		}
 		if jobID == uuid.Nil {
 			continue
 		}
 
-		w.process(ctx, jobID)
+		w.process(w.execCtx, jobID)
 	}
+	slog.Info("worker stopped", "worker_id", w.id)
 }
 
+// Shutdown stops dequeuing and waits up to timeout for the in-flight job to
+// finish. If it doesn't, the job is aborted and recorded as a failed attempt.
 func (w *Worker) Shutdown(timeout time.Duration) {
 	close(w.shutdown)
 	select {
 	case <-w.done:
+		return
 	case <-time.After(timeout):
-		slog.Warn("worker shutdown timeout — in-flight job may be requeued by scheduler")
+	}
+	slog.Warn("worker shutdown timeout — aborting in-flight job")
+	w.abort()
+	select {
+	case <-w.done:
+	case <-time.After(recordTimeout):
+		slog.Warn("in-flight job did not stop — the scheduler will requeue it after its deadline")
 	}
 }
 
@@ -148,24 +180,26 @@ func (w *Worker) process(ctx context.Context, jobID uuid.UUID) {
 	ctx, span := tracer.Start(ctx, "worker.execute")
 	span.SetAttributes(attribute.String("job.id", jobID.String()))
 	defer span.End()
+	defer w.queue.RemoveFromProcessing(context.WithoutCancel(ctx), w.id, jobID) //nolint:errcheck
 
 	token := uuid.New()
-	deadline := time.Now().Add(visibilityTimeout + 30*time.Second)
+	// The first heartbeat extends this; a worker that dies before sending one is
+	// reaped within HeartbeatTTL plus one reaper interval.
+	deadline := time.Now().Add(queue.HeartbeatTTL)
 
 	ok, runID, err := storage.TryClaim(ctx, w.db, jobID, w.id, token, deadline)
 	if err != nil {
 		telemetry.L(ctx).Error("claim failed", "job_id", jobID, "err", err)
 		span.RecordError(err)
-		w.queue.RemoveFromProcessing(ctx, w.id, jobID)
 		return
 	}
 	if !ok {
-		w.queue.RemoveFromProcessing(ctx, w.id, jobID)
 		return
 	}
 
 	j, err := storage.GetJob(ctx, w.db, jobID)
 	if err != nil {
+		// The claim stands; the stale-claim reaper requeues the job once its deadline passes.
 		telemetry.L(ctx).Error("get job after claim", "job_id", jobID, "err", err)
 		span.RecordError(err)
 		return
@@ -187,11 +221,15 @@ func (w *Worker) process(ctx context.Context, jobID uuid.UUID) {
 
 	telemetry.L(ctx).Info("executing job", "job_id", jobID, "type", j.Type, "attempt", j.Attempt, "tenant_id", j.TenantID)
 	start := time.Now()
-	execErr := execute(ctx, j)
+	execErr := w.execute(ctx, j)
 	dur := time.Since(start)
 
 	hbCancel()
 	metrics.WorkerInFlight.Dec()
+
+	// Record the outcome even if execution was aborted by shutdown.
+	recCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recordTimeout)
+	defer cancel()
 
 	tenantID := j.TenantID.String()
 
@@ -201,19 +239,17 @@ func (w *Worker) process(ctx context.Context, jobID uuid.UUID) {
 		span.SetStatus(codes.Error, execErr.Error())
 
 		var nextRunAt *time.Time
+		finalState := "dead"
 		if j.ShouldRetry() {
-			t := job.NextRetryAt(j.Attempt+1, j.BackoffSeconds, time.Now())
+			t := job.NextRetryAt(j.Attempt, j.BackoffSeconds, time.Now())
 			nextRunAt = &t
+			finalState = "failed"
 			metrics.JobRetriesTotal.WithLabelValues(j.Type, tenantID).Inc()
-		}
-		finalState := "failed"
-		if nextRunAt == nil {
-			finalState = "dead"
 		}
 		metrics.JobsTotal.WithLabelValues(j.Type, finalState, tenantID).Inc()
 		metrics.JobDurationSeconds.WithLabelValues(j.Type, finalState, tenantID).Observe(dur.Seconds())
 
-		if err := storage.FailJob(ctx, w.db, jobID, runID, token, execErr.Error(), nextRunAt); err != nil {
+		if err := storage.FailJob(recCtx, w.db, jobID, runID, token, execErr.Error(), nextRunAt); err != nil {
 			telemetry.L(ctx).Error("record job failure", "job_id", jobID, "err", err)
 		}
 	} else {
@@ -221,12 +257,10 @@ func (w *Worker) process(ctx context.Context, jobID uuid.UUID) {
 		span.SetStatus(codes.Ok, "")
 		metrics.JobsTotal.WithLabelValues(j.Type, "succeeded", tenantID).Inc()
 		metrics.JobDurationSeconds.WithLabelValues(j.Type, "succeeded", tenantID).Observe(dur.Seconds())
-		if err := storage.CompleteJob(ctx, w.db, jobID, runID, token); err != nil {
+		if err := storage.CompleteJob(recCtx, w.db, jobID, runID, token); err != nil {
 			telemetry.L(ctx).Error("record job success", "job_id", jobID, "err", err)
 		}
 	}
-
-	w.queue.RemoveFromProcessing(ctx, w.id, jobID)
 }
 
 func (w *Worker) heartbeat(ctx context.Context, jobID uuid.UUID, token uuid.UUID) {
@@ -250,53 +284,11 @@ func (w *Worker) heartbeat(ctx context.Context, jobID uuid.UUID, token uuid.UUID
 	}
 }
 
-func execute(ctx context.Context, j *job.Job) error {
+func (w *Worker) execute(ctx context.Context, j *job.Job) error {
 	switch j.Type {
 	case "webhook":
-		return executeWebhook(ctx, j)
+		return w.executeWebhook(ctx, j)
 	default:
 		return fmt.Errorf("unknown job type: %s", j.Type)
 	}
-}
-
-func executeWebhook(ctx context.Context, j *job.Job) error {
-	var p job.WebhookPayload
-	if err := json.Unmarshal(j.Payload, &p); err != nil {
-		return fmt.Errorf("invalid webhook payload: %w", err)
-	}
-
-	method := p.Method
-	if method == "" {
-		method = http.MethodPost
-	}
-
-	var body *bytes.Reader
-	if len(p.Body) > 0 {
-		body = bytes.NewReader(p.Body)
-	} else {
-		body = bytes.NewReader(nil)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, p.URL, body)
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
-	for k, v := range p.Headers {
-		req.Header.Set(k, v)
-	}
-	if _, ok := p.Headers["Content-Type"]; !ok && len(p.Body) > 0 {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	client := &http.Client{Timeout: httpTimeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("webhook request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("webhook returned %d", resp.StatusCode)
-	}
-	return nil
 }
