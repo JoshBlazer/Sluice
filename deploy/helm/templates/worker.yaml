@@ -23,7 +23,7 @@ spec:
         - name: worker
           image: {{ include "sluice.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["--role", "worker", "--shutdown-timeout", {{ .Values.worker.shutdownTimeout | quote }}]
+          args: ["--role", "worker", "--shutdown-timeout", {{ .Values.worker.shutdownTimeout | quote }}, "--concurrency", {{ .Values.worker.concurrency | quote }}]
           {{- include "sluice.envFrom" . | nindent 10 }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,8 +23,18 @@ var ErrNotFound = errors.New("job not found")
 var ErrClaimConflict = errors.New("job already claimed")
 var ErrDuplicate = errors.New("duplicate idempotency key")
 
-func NewPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+// NewPool connects to Postgres. Unless the DSN sets pool_max_conns explicitly, the
+// pool may open at least minMaxConns connections (pgx's own default is only
+// max(4, NumCPU), too few for a worker running many jobs at once).
+func NewPool(ctx context.Context, dsn string, minMaxConns int32) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres url: %w", err)
+	}
+	if !strings.Contains(dsn, "pool_max_conns") && cfg.MaxConns < minMaxConns {
+		cfg.MaxConns = minMaxConns
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)
 	}

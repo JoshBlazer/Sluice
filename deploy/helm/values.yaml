@@ -36,6 +36,7 @@ scheduler:
 worker:
   replicas: 2
   shutdownTimeout: 45s
+  concurrency: 10
   resources:
     requests:
       cpu: 200m

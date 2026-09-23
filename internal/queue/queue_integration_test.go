@@ -148,3 +148,41 @@ func TestDepthsAndProcessingList(t *testing.T) {
 		t.Fatalf("processing list length = %d after removal", n)
 	}
 }
+
+func TestEnqueue_IdempotentWhileWaiting(t *testing.T) {
+	ctx := context.Background()
+	rdb := testutil.Redis(t)
+	q := queue.New(rdb)
+	tn := uuid.New()
+	id := uuid.New()
+	tenants := []queue.TenantWeight{{ID: tn, Weight: 1}}
+
+	for i := 0; i < 5; i++ {
+		if err := q.Enqueue(ctx, tn, id, job.PriorityNormal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	depths, _ := q.Depths(ctx, []uuid.UUID{tn})
+	var total int64
+	for _, d := range depths {
+		total += d.Depth
+	}
+	if total != 1 {
+		t.Fatalf("queue holds %d entries after 5 enqueues of one job, want 1", total)
+	}
+	if ttl := rdb.TTL(ctx, "enqueued:"+id.String()).Val(); ttl <= 0 || ttl > queue.EnqueuedTTL {
+		t.Fatalf("marker TTL = %v, want within (0, %v]", ttl, queue.EnqueuedTTL)
+	}
+
+	got, err := q.Dequeue(ctx, "w1", tenants, time.Second)
+	if err != nil || got != id {
+		t.Fatalf("dequeue = %s, %v", got, err)
+	}
+	// Once popped, the job can be enqueued again (e.g. for a retry).
+	if err := q.Enqueue(ctx, tn, id, job.PriorityNormal); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := q.Dequeue(ctx, "w1", tenants, time.Second); got != id {
+		t.Fatalf("re-enqueued job not dequeued: got %s", got)
+	}
+}

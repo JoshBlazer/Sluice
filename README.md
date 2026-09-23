@@ -299,6 +299,7 @@ Every flag can also be set by environment variable:
 | `SLUICE_OTLP_ENDPOINT` | `--otlp-endpoint` | `localhost:4318` |
 | `SLUICE_PORT` | `--port` | `8080` (api) |
 | `SLUICE_METRICS_PORT` | `--metrics-port` | `9091` (scheduler), `9092` (worker) |
+| `SLUICE_WORKER_CONCURRENCY` | `--concurrency` | `10`. Jobs each worker process runs at once. Workers size their Postgres pool to match unless the URL sets `pool_max_conns` |
 | `SLUICE_WEBHOOK_ALLOW_PRIVATE` | `--webhook-allow-private` | `false`. When false, webhooks to loopback, private, link-local (cloud metadata) and other non-public addresses are refused |
 | | `--shutdown-timeout` | `30s`. How long a stopping worker waits for its in-flight job before aborting it |
 
@@ -330,7 +331,7 @@ go run ./cmd/sluice-cli create-tenant -rate-limit 0 loadtest   # note the key
 go run ./scripts/loadtest -key <key> -n 20000 -c 64
 ```
 
-It reports submission throughput, submit latency, and submit→execute latency percentiles. Each worker process runs one job at a time, so execution throughput scales with worker replicas.
+It reports submission throughput, submit latency, and submit→execute latency percentiles. Execution throughput scales with worker replicas × `--concurrency`. The API's Postgres pool defaults to pgx's `max(4, NumCPU)` connections; under heavy submission load, raise it with `pool_max_conns` in `SLUICE_POSTGRES_URL`.
 
 ---
 
