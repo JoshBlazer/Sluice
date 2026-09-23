@@ -109,6 +109,31 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, j)
 }
 
+// handleListJobRuns returns a job's attempt history, oldest first.
+func (s *Server) handleListJobRuns(w http.ResponseWriter, r *http.Request) {
+	t, _ := tenant.FromContext(r.Context())
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid job id")
+		return
+	}
+	if _, err := storage.GetJobForTenant(r.Context(), s.db, id, t.ID); errors.Is(err, storage.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "job not found")
+		return
+	} else if err != nil {
+		slog.Error("get job", "job_id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to get job")
+		return
+	}
+	runs, err := storage.ListJobRuns(r.Context(), s.db, id, t.ID)
+	if err != nil {
+		slog.Error("list job runs", "job_id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to list runs")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": runs, "count": len(runs)})
+}
+
 func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	t, _ := tenant.FromContext(r.Context())
 	filter := storage.ListFilter{TenantID: &t.ID, Limit: 50}
@@ -120,6 +145,14 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		filter.State = &st
+	}
+	if v := r.URL.Query().Get("retried"); v != "" {
+		retried, err := strconv.ParseBool(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "retried must be true or false")
+			return
+		}
+		filter.Retried = retried
 	}
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
