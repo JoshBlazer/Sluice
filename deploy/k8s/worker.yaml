@@ -1,33 +1,28 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: Sluice-worker
-  namespace: Sluice
+  name: sluice-worker
+  namespace: sluice
   labels:
-    app: Sluice-worker
+    app: sluice-worker
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: Sluice-worker
+      app: sluice-worker
   template:
     metadata:
       labels:
-        app: Sluice-worker
+        app: sluice-worker
     spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: worker
-          image: Sluice:latest
+          image: sluice:latest
           args: ["--role", "worker", "--shutdown-timeout", "45s"]
           envFrom:
             - configMapRef:
-                name: Sluice-config
-          lifecycle:
-            preStop:
-              exec:
-                # Give the worker time to drain before the pod is killed.
-                command: ["/bin/sh", "-c", "kill -SIGTERM 1 && sleep 5"]
+                name: sluice-config
           resources:
             requests:
               cpu: 200m
@@ -36,33 +31,24 @@ spec:
               cpu: 1000m
               memory: 256Mi
 ---
-# KEDA ScaledObject — scales worker replicas based on Redis queue depth.
-# Requires KEDA to be installed in the cluster (https://keda.sh).
+# KEDA ScaledObject - scales worker replicas on total Redis queue depth, read
+# from the sluice_queue_depth gauge the scheduler leader exports.
+# Requires KEDA (https://keda.sh) and a Prometheus that scrapes the scheduler.
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
-  name: Sluice-worker-scaler
-  namespace: Sluice
+  name: sluice-worker-scaler
+  namespace: sluice
 spec:
   scaleTargetRef:
-    name: Sluice-worker
+    name: sluice-worker
   minReplicaCount: 1
   maxReplicaCount: 20
   pollingInterval: 15
   cooldownPeriod: 60
   triggers:
-    - type: redis
+    - type: prometheus
       metadata:
-        address: redis:6379
-        listName: queue:1
-        listLength: "10"
-    - type: redis
-      metadata:
-        address: redis:6379
-        listName: queue:5
-        listLength: "10"
-    - type: redis
-      metadata:
-        address: redis:6379
-        listName: queue:10
-        listLength: "10"
+        serverAddress: http://prometheus:9090
+        query: sum(sluice_queue_depth)
+        threshold: "10"

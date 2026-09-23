@@ -124,7 +124,7 @@ forever:
   job = redis.BRPOPLPUSH(queue, processing_queue, timeout=5s)
   if job:
     claim_token = uuid.v4()
-    if !postgres.try_claim(job.id, claim_token, deadline=now+timeout+30s):
+    if !postgres.try_claim(job.id, claim_token, deadline=now+15s):  # first heartbeat extends it
       continue  # someone else got it, or it's been canceled
 
     redis.SET(heartbeat_key(job.id), claim_token, EX=15s)
@@ -181,7 +181,8 @@ CREATE TYPE job_state AS ENUM (
     'running',     -- worker is executing
     'succeeded',   -- terminal
     'failed',      -- will retry
-    'dead'         -- terminal, exhausted retries
+    'dead',        -- terminal, exhausted retries
+    'cancelled'    -- terminal, cancelled before it ran
 );
 
 -- Indexes for scheduler queries
@@ -250,7 +251,7 @@ queue:{tenant_id}:{priority}     LIST    job IDs awaiting workers
 processing:{worker_id}           LIST    jobs currently held by a worker
 heartbeat:{job_id}               STRING  TTL-based heartbeat (15s)
 dedupe:{tenant_id}:{idem_key}    STRING  job ID for idempotency (24h TTL)
-ratelimit:{tenant_id}            STRING  token bucket state
+ratelimit:{tenant_id}            HASH    token bucket state (tokens, last refill ms)
 ```
 
 The principle: every entry in Redis can be reconstructed from Postgres in case of Redis loss. Redis is purely a performance layer.
@@ -273,11 +274,16 @@ stateDiagram-v2
     running --> failed: timeout / heartbeat lost
     claimed --> failed: timeout / heartbeat lost
     
-    failed --> pending: attempt < max_retries (after backoff)
-    failed --> dead: attempt >= max_retries
+    failed --> pending: attempts so far <= max_retries (after backoff)
+    running --> dead: error with retries exhausted
+    
+    pending --> cancelled: cancel
+    scheduled --> cancelled: cancel
+    failed --> cancelled: cancel
     
     succeeded --> [*]
     dead --> [*]
+    cancelled --> [*]
 ```
 
 The transitions are explicit in the schema (`state` column) and audited in the `job_runs` table. Every state change increments a Prometheus counter labeled with `tenant_id`, `job_type`, and `outcome`.

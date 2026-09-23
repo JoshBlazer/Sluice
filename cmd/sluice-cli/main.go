@@ -9,15 +9,15 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"github.com/sluice/internal/job"
 	"github.com/sluice/internal/queue"
 	"github.com/sluice/internal/storage"
-	"github.com/redis/go-redis/v9"
 )
 
 func main() {
-	postgresURL := flag.String("postgres-url", env("sluice_POSTGRES_URL", "postgres://pulse:pulse@localhost:5433/pulse?sslmode=disable"), "postgres DSN")
-	redisAddr := flag.String("redis-addr", env("sluice_REDIS_ADDR", "localhost:6379"), "redis address")
+	postgresURL := flag.String("postgres-url", env("SLUICE_POSTGRES_URL", "postgres://sluice:sluice@localhost:5433/sluice?sslmode=disable"), "postgres DSN")
+	redisAddr := flag.String("redis-addr", env("SLUICE_REDIS_ADDR", "localhost:6379"), "redis address")
 	flag.Parse()
 
 	if flag.NArg() == 0 {
@@ -51,7 +51,11 @@ func main() {
 	case "list-dead":
 		cmdListDead(ctx, db)
 	case "queue-depth":
-		cmdQueueDepth(ctx, rdb)
+		cmdQueueDepth(ctx, db, q)
+	case "create-tenant":
+		cmdCreateTenant(ctx, db, flag.Args()[1:])
+	case "rotate-key":
+		cmdRotateKey(ctx, db, flag.Args()[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", flag.Arg(0))
 		usage()
@@ -61,7 +65,7 @@ func main() {
 
 func cmdReplay(ctx context.Context, db *pgxpool.Pool, q *queue.Queue, args []string) {
 	if len(args) == 0 {
-		fatalf("usage: pulse-cli replay <job-id>")
+		fatalf("usage: sluice-cli replay <job-id>")
 	}
 	jobID, err := uuid.Parse(args[0])
 	if err != nil {
@@ -76,13 +80,9 @@ func cmdReplay(ctx context.Context, db *pgxpool.Pool, q *queue.Queue, args []str
 		fatalf("job %s is in state %s, not dead — only dead jobs can be replayed", jobID, j.State)
 	}
 
-	// Move back to pending and re-enqueue.
-	_, err = db.Exec(ctx, `
-		UPDATE jobs SET state = 'pending', attempt = 0, last_error = NULL,
-		    claim_token = NULL, claimed_at = NULL, claimed_by = NULL, deadline = NULL
-		WHERE id = $1 AND state = 'dead'`, jobID)
+	j, err = storage.ReplayJob(ctx, db, jobID, j.TenantID)
 	if err != nil {
-		fatalf("reset job state: %v", err)
+		fatalf("replay: %v", err)
 	}
 	if err := q.Enqueue(ctx, j.TenantID, jobID, j.Priority); err != nil {
 		fatalf("enqueue: %v", err)
@@ -92,22 +92,38 @@ func cmdReplay(ctx context.Context, db *pgxpool.Pool, q *queue.Queue, args []str
 
 func cmdForceFail(ctx context.Context, db *pgxpool.Pool, args []string) {
 	if len(args) == 0 {
-		fatalf("usage: pulse-cli force-fail <job-id>")
+		fatalf("usage: sluice-cli force-fail <job-id>")
 	}
 	jobID, err := uuid.Parse(args[0])
 	if err != nil {
 		fatalf("invalid job id: %v", err)
 	}
 
-	tag, err := db.Exec(ctx, `
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	tag, err := tx.Exec(ctx, `
 		UPDATE jobs SET state = 'dead', last_error = 'force-failed by operator',
 		    claim_token = NULL, deadline = NULL
-		WHERE id = $1 AND state IN ('claimed', 'running', 'pending', 'failed')`, jobID)
+		WHERE id = $1 AND state IN ('claimed', 'running', 'pending', 'scheduled', 'failed')`, jobID)
 	if err != nil {
 		fatalf("force-fail: %v", err)
 	}
 	if tag.RowsAffected() == 0 {
 		fatalf("job %s not found or already terminal", jobID)
+	}
+	// Close any run a worker still has open; its eventual result is discarded
+	// because the claim token was cleared above.
+	if _, err := tx.Exec(ctx, `
+		UPDATE job_runs SET state = 'dead', finished_at = NOW(), error = 'force-failed by operator',
+		    duration_ms = (EXTRACT(EPOCH FROM (NOW() - started_at)) * 1000)::INT
+		WHERE job_id = $1 AND finished_at IS NULL`, jobID); err != nil {
+		fatalf("close open run: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		fatalf("commit: %v", err)
 	}
 	fmt.Printf("force-failed job %s\n", jobID)
 }
@@ -149,19 +165,69 @@ func cmdListDead(ctx context.Context, db *pgxpool.Pool) {
 	}
 }
 
-func cmdQueueDepth(ctx context.Context, rdb *redis.Client) {
-	queues := []string{"queue:1", "queue:5", "queue:10"}
-	labels := []string{"high", "normal", "low"}
-
-	fmt.Printf("%-12s  %s\n", "PRIORITY", "DEPTH")
-	fmt.Println(repeat("-", 24))
-	for i, key := range queues {
-		n, err := rdb.LLen(ctx, key).Result()
-		if err != nil {
-			n = -1
-		}
-		fmt.Printf("%-12s  %d\n", labels[i], n)
+func cmdQueueDepth(ctx context.Context, db *pgxpool.Pool, q *queue.Queue) {
+	tenants, err := storage.GetTenants(ctx, db)
+	if err != nil {
+		fatalf("load tenants: %v", err)
 	}
+	ids := make([]uuid.UUID, len(tenants))
+	names := make(map[uuid.UUID]string, len(tenants))
+	for i, t := range tenants {
+		ids[i] = t.ID
+		names[t.ID] = t.Name
+	}
+	depths, err := q.Depths(ctx, ids)
+	if err != nil {
+		fatalf("read queue depths: %v", err)
+	}
+
+	totals := map[string]int64{}
+	fmt.Printf("%-24s  %-8s  %s\n", "TENANT", "PRIORITY", "DEPTH")
+	fmt.Println(repeat("-", 44))
+	for _, d := range depths {
+		totals[d.Priority] += d.Depth
+		if d.Depth > 0 {
+			fmt.Printf("%-24s  %-8s  %d\n", names[d.TenantID], d.Priority, d.Depth)
+		}
+	}
+	fmt.Println(repeat("-", 44))
+	for _, p := range []string{"high", "normal", "low"} {
+		fmt.Printf("%-24s  %-8s  %d\n", "(all tenants)", p, totals[p])
+	}
+}
+
+func cmdCreateTenant(ctx context.Context, db *pgxpool.Pool, args []string) {
+	fs := flag.NewFlagSet("create-tenant", flag.ExitOnError)
+	rateLimit := fs.Int("rate-limit", 100, "max job submissions per second (0 = unlimited)")
+	weight := fs.Int("weight", 100, "fair-queuing weight relative to other tenants")
+	fs.Parse(args) //nolint:errcheck // ExitOnError exits instead of returning
+	if fs.NArg() != 1 {
+		fatalf("usage: sluice-cli create-tenant [-rate-limit N] [-weight N] <name>")
+	}
+	if *weight <= 0 {
+		fatalf("weight must be positive")
+	}
+
+	t, key, err := storage.InsertTenant(ctx, db, fs.Arg(0), *rateLimit, *weight)
+	if err != nil {
+		fatalf("create tenant: %v", err)
+	}
+	fmt.Printf("tenant id: %s\napi key:   %s\n\nStore the key now — only its hash is kept.\n", t.ID, key)
+}
+
+func cmdRotateKey(ctx context.Context, db *pgxpool.Pool, args []string) {
+	if len(args) != 1 {
+		fatalf("usage: sluice-cli rotate-key <tenant-id>")
+	}
+	tenantID, err := uuid.Parse(args[0])
+	if err != nil {
+		fatalf("invalid tenant id: %v", err)
+	}
+	key, err := storage.RotateAPIKey(ctx, db, tenantID)
+	if err != nil {
+		fatalf("rotate key: %v", err)
+	}
+	fmt.Printf("new api key: %s\n\nThe old key no longer works. Store this one now — only its hash is kept.\n", key)
 }
 
 func cmdDrain(ctx context.Context, rdb *redis.Client) {
@@ -274,7 +340,10 @@ func cmdDumpScheduler(ctx context.Context, db *pgxpool.Pool, rdb *redis.Client) 
 
 	fmt.Println("\nREDIS QUEUE DEPTHS")
 	var cursor uint64
-	type qd struct{ key string; n int64 }
+	type qd struct {
+		key string
+		n   int64
+	}
 	var depths []qd
 	for {
 		keys, next, err := rdb.Scan(ctx, cursor, "queue:*", 100).Result()
@@ -302,7 +371,7 @@ func cmdDumpScheduler(ctx context.Context, db *pgxpool.Pool, rdb *redis.Client) 
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `pulse-cli — Pulse admin tool
+	fmt.Fprintln(os.Stderr, `sluice-cli — Sluice admin tool
 
 Commands:
   replay <job-id>     re-enqueue a dead-letter job from the beginning
@@ -310,7 +379,10 @@ Commands:
   drain               flush all Redis queues (jobs stay in postgres)
   dump-scheduler      show job counts, active workers, schedules, queue depths
   list-dead           list dead-letter jobs (most recent 50)
-  queue-depth         show pending job counts per priority queue
+  queue-depth         show pending job counts per tenant and priority
+  create-tenant       create a tenant and print its API key
+                      (flags: -rate-limit N, -weight N)
+  rotate-key <id>     issue a new API key for a tenant, revoking the old one
 
 Flags:`)
 	flag.PrintDefaults()

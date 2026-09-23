@@ -1,10 +1,10 @@
 image:
-  repository: Sluice
+  repository: sluice
   tag: latest
   pullPolicy: IfNotPresent
 
 postgres:
-  url: "postgres://Sluice:Sluice@postgres:5432/Sluice?sslmode=disable"
+  url: "postgres://sluice:sluice@postgres:5432/sluice?sslmode=disable"
 
 redis:
   addr: "redis:6379"
@@ -48,3 +48,4 @@ worker:
     minReplicas: 1
     maxReplicas: 20
     queueDepthPerReplica: 10
+    prometheusAddress: http://prometheus:9090

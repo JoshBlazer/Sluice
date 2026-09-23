@@ -9,9 +9,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/robfig/cron/v3"
+	"github.com/sluice/internal/job"
 	"github.com/sluice/internal/storage"
 	"github.com/sluice/internal/tenant"
-	"github.com/robfig/cron/v3"
 )
 
 type createScheduleRequest struct {
@@ -25,7 +26,7 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 	t, _ := tenant.FromContext(r.Context())
 
 	var req createScheduleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -39,6 +40,15 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.JobTemplate) == 0 {
 		writeError(w, http.StatusBadRequest, "job_template is required")
+		return
+	}
+	var tmpl job.Template
+	if err := json.Unmarshal(req.JobTemplate, &tmpl); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid job_template")
+		return
+	}
+	if _, err := tmpl.Build(t.ID, time.Now()); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid job_template: "+err.Error())
 		return
 	}
 
@@ -97,12 +107,13 @@ func (s *Server) handleListSchedules(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetSchedule(w http.ResponseWriter, r *http.Request) {
+	t, _ := tenant.FromContext(r.Context())
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid schedule id")
 		return
 	}
-	sched, err := storage.GetSchedule(r.Context(), s.db, id)
+	sched, err := storage.GetSchedule(r.Context(), s.db, id, t.ID)
 	if errors.Is(err, storage.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "schedule not found")
 		return

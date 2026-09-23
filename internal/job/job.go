@@ -18,7 +18,17 @@ const (
 	StateSucceeded State = "succeeded"
 	StateFailed    State = "failed"
 	StateDead      State = "dead"
+	StateCancelled State = "cancelled"
 )
+
+func (s State) Valid() bool {
+	switch s {
+	case StatePending, StateScheduled, StateClaimed, StateRunning,
+		StateSucceeded, StateFailed, StateDead, StateCancelled:
+		return true
+	}
+	return false
+}
 
 // Priority constants — lower number = higher priority.
 const (
@@ -28,30 +38,32 @@ const (
 )
 
 type Job struct {
-	ID             uuid.UUID
-	TenantID       uuid.UUID
-	Type           string
-	Payload        json.RawMessage
-	Priority       int16
-	State          State
-	RunAt          time.Time
-	ClaimedAt      *time.Time
-	ClaimedBy      *string
-	ClaimToken     *uuid.UUID
-	Deadline       *time.Time
-	Attempt        int
-	MaxRetries     int
-	BackoffSeconds int
-	IdempotencyKey *string
-	LastError      *string
-	CreatedAt      time.Time
-	CompletedAt    *time.Time
+	ID             uuid.UUID       `json:"id"`
+	TenantID       uuid.UUID       `json:"tenant_id"`
+	Type           string          `json:"type"`
+	Payload        json.RawMessage `json:"payload"`
+	Priority       int16           `json:"priority"`
+	State          State           `json:"state"`
+	RunAt          time.Time       `json:"run_at"`
+	ClaimedAt      *time.Time      `json:"claimed_at,omitempty"`
+	ClaimedBy      *string         `json:"claimed_by,omitempty"`
+	ClaimToken     *uuid.UUID      `json:"-"`
+	Deadline       *time.Time      `json:"deadline,omitempty"`
+	Attempt        int             `json:"attempt"`
+	MaxRetries     int             `json:"max_retries"`
+	BackoffSeconds int             `json:"backoff_seconds"`
+	IdempotencyKey *string         `json:"idempotency_key,omitempty"`
+	LastError      *string         `json:"last_error,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+	CompletedAt    *time.Time      `json:"completed_at,omitempty"`
 }
 
 func (j *Job) IsTerminal() bool {
-	return j.State == StateSucceeded || j.State == StateDead
+	return j.State == StateSucceeded || j.State == StateDead || j.State == StateCancelled
 }
 
+// ShouldRetry reports whether a failure of the current attempt earns another one.
+// Attempt counts prior failed attempts, so max_retries=3 allows 4 executions in total.
 func (j *Job) ShouldRetry() bool {
 	return j.Attempt < j.MaxRetries
 }

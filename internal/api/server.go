@@ -13,25 +13,26 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sluice/internal/queue"
 	"github.com/sluice/internal/ratelimit"
-	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
+
+const maxBodyBytes = 1 << 20
 
 type Server struct {
 	db      *pgxpool.Pool
 	queue   *queue.Queue
-	rdb     *redis.Client
 	limiter *ratelimit.Limiter
 	server  *http.Server
 }
 
-func New(db *pgxpool.Pool, q *queue.Queue, rdb *redis.Client, limiter *ratelimit.Limiter, port int) *Server {
-	s := &Server{db: db, queue: q, rdb: rdb, limiter: limiter}
+func New(db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter, port int) *Server {
+	s := &Server{db: db, queue: q, limiter: limiter}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
+	r.Use(metricsMiddleware)
 	r.Use(corsMiddleware)
 	r.Use(correlationMiddleware)
 
@@ -56,7 +57,7 @@ func New(db *pgxpool.Pool, q *queue.Queue, rdb *redis.Client, limiter *ratelimit
 		r.Get("/schedules/{id}", s.handleGetSchedule)
 		r.Delete("/schedules/{id}", s.handleDeleteSchedule)
 
-		// Dashboard data endpoints (no tenant scoping — admin-level)
+		// Dashboard data endpoints, scoped to the calling tenant.
 		r.Get("/stats", s.handleStats)
 		r.Get("/stats/runs", s.handleRecentRuns)
 		r.Get("/stats/dead-letter", s.handleDeadLetter)
@@ -64,12 +65,23 @@ func New(db *pgxpool.Pool, q *queue.Queue, rdb *redis.Client, limiter *ratelimit
 
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
-		Handler:      otelhttp.NewHandler(r, "sluice-api"),
+		Handler:      s.Handler(r),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 	return s
+}
+
+// Handler wraps the router with tracing. Exposed separately so tests can
+// serve the API from httptest without binding a port.
+func (s *Server) Handler(r http.Handler) http.Handler {
+	return otelhttp.NewHandler(r, "sluice-api")
+}
+
+// Routes returns the fully wrapped HTTP handler.
+func (s *Server) Routes() http.Handler {
+	return s.server.Handler
 }
 
 func (s *Server) Start() error {

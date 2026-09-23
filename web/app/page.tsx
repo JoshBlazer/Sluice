@@ -33,6 +33,7 @@ const STATE_COLORS: Record<string, string> = {
   claimed: "text-purple-400",
   running: "text-violet-400",
   scheduled: "text-sky-400",
+  cancelled: "text-zinc-400",
 };
 
 const STATE_BAR_COLORS: Record<string, string> = {
@@ -43,10 +44,11 @@ const STATE_BAR_COLORS: Record<string, string> = {
   claimed: "#8b5cf6",
   pending: "#60a5fa",
   scheduled: "#38bdf8",
+  cancelled: "#a1a1aa",
 };
 
 const ACTIVE_STATES = ["pending", "scheduled", "claimed", "running"];
-const TERMINAL_STATES = ["succeeded", "failed", "dead"];
+const TERMINAL_STATES = ["succeeded", "failed", "dead", "cancelled"];
 
 export default function QueuePage() {
   useEffect(() => { document.title = "Queue — Sluice"; }, []);

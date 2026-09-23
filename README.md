@@ -27,10 +27,17 @@ Most teams reach for either a Redis-only queue (fast but loses jobs on crash) or
 ## Quick Start
 
 ```bash
-# Spin up Postgres, Redis, etcd, Jaeger, and Prometheus
-docker-compose up -d
+# Spin up Postgres, Redis, etcd, Jaeger, and Prometheus, then create the schema
+docker compose up -d
+make migrate-up
 
-# Submit a job
+# Run each role (separate terminals). The dev worker flag lets webhooks
+# reach localhost; production workers refuse private addresses.
+make dev-api
+make dev-scheduler
+SLUICE_WEBHOOK_ALLOW_PRIVATE=true make dev-worker
+
+# Submit a job (dev-token is the seeded local tenant)
 curl -X POST http://localhost:8080/v1/jobs \
   -H "Authorization: Bearer dev-token" \
   -H "Content-Type: application/json" \
@@ -49,7 +56,7 @@ curl -X POST http://localhost:8080/v1/jobs \
   -d '{
     "type": "webhook",
     "payload": {"url": "https://example.com/reminder"},
-    "run_at": "2026-01-15T10:00:00Z"
+    "run_at": "2030-01-15T10:00:00Z"
   }'
 
 # Register a recurring job
@@ -59,6 +66,7 @@ curl -X POST http://localhost:8080/v1/schedules \
   -d '{
     "name": "nightly-cleanup",
     "cron": "0 2 * * *",
+    "timezone": "Europe/London",
     "job_template": {
       "type": "webhook",
       "payload": {"url": "https://example.com/cleanup"}
@@ -70,7 +78,20 @@ cd web && npm install && npm run dev -- --port 3000
 # open http://localhost:3000
 ```
 
-Priority is an integer: `1` = high, `5` = normal, `10` = low.
+Priority is an integer from `1` (highest) to `10` (lowest), in three lanes: `1` = high, `2`–`5` = normal, `6`–`10` = low. A high-priority job from any tenant runs before every normal one.
+
+`max_retries` is the number of retries after the first attempt, so `max_retries: 3` means up to 4 executions. The first retry waits `backoff_seconds` (default 30), then doubles each time, capped at an hour, with ±20% jitter.
+
+### Tenants and API keys
+
+API keys are stored only as SHA-256 hashes. Create a tenant and get its key with the admin CLI:
+
+```bash
+go run ./cmd/sluice-cli create-tenant -rate-limit 200 -weight 100 acme
+go run ./cmd/sluice-cli rotate-key <tenant-id>   # revokes the old key
+```
+
+`dev-token` is seeded by the migrations for local use only. Before any real deployment, disable it: `UPDATE tenants SET status = 'disabled' WHERE name = 'dev';`
 
 ---
 
@@ -137,13 +158,13 @@ Full design and trade-offs are documented in [architecture.md](architecture.md).
 - **Metrics**: queue depth, processing latency histogram, retry counts, worker health, throughput per tenant
 - **Tracing**: distributed traces from API submission to job completion via OpenTelemetry + Jaeger
 - **Logs**: structured JSON via `log/slog` with correlation IDs threaded through context
-- **Dashboard**: real-time queue depth, recent runs, dead-letter inspection
+- **Dashboard**: real-time queue depth, recent runs, dead-letter inspection, scoped to the API key it runs with
 
 ### Operations
 
 - **Graceful shutdown**: workers drain in-flight jobs before exiting (configurable timeout)
-- **Hot config reload**: SIGHUP reloads tenant configs and rate limits without restart
-- **Admin CLI**: replay dead-letter jobs, drain queues, force-fail stuck jobs, dump scheduler state
+- **Hot config reload**: SIGHUP makes workers reload tenant weights immediately (they also refresh every 60s); rate-limit changes apply on the next request
+- **Admin CLI**: create tenants, rotate keys, replay dead-letter jobs, drain queues, force-fail stuck jobs, dump scheduler state
 - **Backup-friendly**: Postgres is the source of truth; standard backup tooling applies
 
 ---
@@ -159,6 +180,8 @@ Design targets on a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, Redis 
 | End-to-end latency (p99) | < 50 ms (submit → pickup) |
 | Scheduler failover | < 2 seconds (leader → hot standby) |
 | Recovery from full node loss | < 30 seconds (all in-flight jobs) |
+
+These are design targets, not measured results. `scripts/loadtest` measures submission throughput and submit→execute latency against a running stack; see [Load testing](#load-testing).
 
 ---
 
@@ -189,7 +212,7 @@ Design targets on a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, Redis 
 
 **Testing**
 - `testing` (standard library) for unit tests
-- Integration tests dial the docker-compose Postgres/Redis directly and skip if not reachable
+- Integration tests (`-tags integration`) dial the docker-compose Postgres/Redis directly and skip if not reachable
 
 **Deployment**
 - Docker multi-stage builds
@@ -214,10 +237,14 @@ sluice/
 │   ├── queue/            # Redis queue abstraction
 │   ├── job/              # Domain types, state machine
 │   ├── tenant/           # Multi-tenancy context
-│   ├── ratelimit/        # Fixed-window rate limiter per tenant
-│   └── telemetry/        # Metrics, tracing, logging
+│   ├── ratelimit/        # Token-bucket rate limiter per tenant
+│   ├── metrics/          # Prometheus collectors
+│   ├── leader/           # etcd leader election
+│   ├── testutil/         # Integration-test helpers
+│   └── telemetry/        # Tracing and logging
 ├── migrations/           # SQL migrations (golang-migrate)
 ├── web/                  # Next.js dashboard
+├── scripts/loadtest/     # Load generator for the performance targets
 ├── deploy/
 │   ├── docker/
 │   ├── k8s/
@@ -241,7 +268,7 @@ sluice/
 ```bash
 # Clone and install tools
 git clone https://github.com/JoshBlazer/Sluice
-cd jobit
+cd Sluice
 make bootstrap        # installs migrate, downloads Go modules
 
 # Start infrastructure
@@ -253,11 +280,27 @@ make migrate-up
 # Run each role in separate terminals
 make dev-api
 make dev-scheduler
-make dev-worker
+SLUICE_WEBHOOK_ALLOW_PRIVATE=true make dev-worker
 
-# Dashboard
+# Dashboard (uses dev-token unless NEXT_PUBLIC_API_TOKEN is set)
 cd web && npm install && npm run dev
 ```
+
+### Configuration
+
+Every flag can also be set by environment variable:
+
+| Variable | Flag | Default |
+|----------|------|---------|
+| `SLUICE_ROLE` | `--role` | (required) `api`, `scheduler` or `worker` |
+| `SLUICE_POSTGRES_URL` | `--postgres-url` | `postgres://sluice:sluice@localhost:5433/sluice?sslmode=disable` |
+| `SLUICE_REDIS_ADDR` | `--redis-addr` | `localhost:6379` |
+| `SLUICE_ETCD_ENDPOINTS` | `--etcd-endpoints` | `localhost:2379` |
+| `SLUICE_OTLP_ENDPOINT` | `--otlp-endpoint` | `localhost:4318` |
+| `SLUICE_PORT` | `--port` | `8080` (api) |
+| `SLUICE_METRICS_PORT` | `--metrics-port` | `9091` (scheduler), `9092` (worker) |
+| `SLUICE_WEBHOOK_ALLOW_PRIVATE` | `--webhook-allow-private` | `false`. When false, webhooks to loopback, private, link-local (cloud metadata) and other non-public addresses are refused |
+| | `--shutdown-timeout` | `30s`. How long a stopping worker waits for its in-flight job before aborting it |
 
 ### Common Tasks
 
@@ -274,34 +317,49 @@ make docker-build     # build the Docker image
 
 Two tiers:
 
-1. **Unit tests** — pure logic, no I/O. Run in < 5 seconds. `make test-unit`
-2. **Integration tests** — dial Postgres and Redis directly; skip gracefully if the stack isn't up. Run locally with `make up && make migrate-up && make test-integration`. `make test-integration`
+1. **Unit tests** — no I/O. `make test-unit`
+2. **Integration tests** (`-tags integration`) — run the API, worker, scheduler loops, queue and storage against real Postgres and Redis: retries into dead letter, crashed-worker recovery, graceful drain, tenant isolation, rate limits, cron dedup. They use Redis DB 15 and throwaway tenants, so they don't disturb local dev data, and skip if the stack isn't up. `make up && make migrate-up && make test-integration`
 
-CI runs both on every push and pull request against real Postgres 16 and Redis 7 service containers.
+CI runs both with `-race` on every push and pull request, and there a missing stack is a failure rather than a skip (`SLUICE_TEST_REQUIRE_INFRA=1`). CI also builds the Docker image, lints and renders the Helm chart, and builds the dashboard.
+
+### Load testing
+
+```bash
+go run ./cmd/sluice-cli create-tenant -rate-limit 0 loadtest   # note the key
+# start api, scheduler and one or more workers with SLUICE_WEBHOOK_ALLOW_PRIVATE=true
+go run ./scripts/loadtest -key <key> -n 20000 -c 64
+```
+
+It reports submission throughput, submit latency, and submit→execute latency percentiles. Each worker process runs one job at a time, so execution throughput scales with worker replicas.
 
 ---
 
 ## Deployment
 
-### Docker Compose (single host)
+### Docker image
 
 ```bash
-docker-compose -f deploy/docker/docker-compose.prod.yml up -d
+make docker-build     # sluice:dev, containing /sluice and /sluice-cli
+docker run --rm -e SLUICE_POSTGRES_URL=... -e SLUICE_REDIS_ADDR=... sluice:dev --role worker
 ```
 
 ### Kubernetes
 
+The chart expects Postgres, Redis and etcd to exist already, and migrations to have been applied.
+
 ```bash
-helm install sluice deploy/helm/sluice \
-  --set postgres.password=$PG_PASSWORD \
-  --set workers.replicas=10
+helm install sluice deploy/helm \
+  --set postgres.url="postgres://sluice:$PG_PASSWORD@postgres:5432/sluice?sslmode=require" \
+  --set worker.replicas=10
 ```
+
+Worker autoscaling uses a KEDA `ScaledObject` on `sum(sluice_queue_depth)`, which the scheduler leader exports. It needs KEDA installed and a Prometheus that scrapes the scheduler (`worker.autoscaling.prometheusAddress`); set `worker.autoscaling.enabled=false` otherwise.
 
 Recommended production layout:
 
 - 2× API replicas (stateless, load-balanced)
 - 3× Scheduler replicas (1 leader + 2 hot standbys via etcd lease)
-- 10× Worker replicas (scaled by HPA on queue depth)
+- 10× Worker replicas (scaled by KEDA on queue depth)
 - 1× Postgres primary + 1 replica
 - 1× Redis with persistence + 1 replica
 - 3× etcd nodes
@@ -325,6 +383,13 @@ sluice-cli dump-scheduler
 
 # List the 50 most recent dead-letter entries
 sluice-cli list-dead
+
+# Queue depth per tenant and priority
+sluice-cli queue-depth
+
+# Create a tenant (prints its API key once) / replace a tenant's key
+sluice-cli create-tenant [-rate-limit N] [-weight N] <name>
+sluice-cli rotate-key <tenant-id>
 ```
 
 ---

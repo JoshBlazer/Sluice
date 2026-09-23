@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
@@ -11,22 +10,39 @@ import (
 	"github.com/sluice/internal/storage"
 )
 
+// Browsers can't set an Authorization header on a WebSocket handshake, so the
+// API key travels as ?token=. Origin checks add nothing on top of that: the key
+// is never sent ambiently the way a cookie would be.
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true }, // permissive for local dev
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// handleWebSocket upgrades the connection and streams a live snapshot every second.
-// The snapshot carries queue depths and job-by-state counts — enough for the dashboard.
+// handleWebSocket authenticates the caller, then streams a snapshot of their
+// tenant's queue depths and job counts every second.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.Query().Get("token")
+	if key == "" {
+		key = extractBearerToken(r)
+	}
+	if key == "" {
+		writeError(w, http.StatusUnauthorized, "missing api key")
+		return
+	}
+	t, err := storage.GetTenantByAPIKey(r.Context(), s.db, key)
+	if err != nil {
+		if err != storage.ErrNotFound {
+			slog.Error("ws tenant lookup", "err", err)
+		}
+		writeError(w, http.StatusUnauthorized, "invalid api key")
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		slog.Error("ws upgrade", "err", err)
 		return
 	}
 	defer conn.Close()
-
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -41,64 +57,21 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			depths, err := s.queueDepths(ctx)
+			snap, err := s.snapshot(ctx, t)
 			if err != nil {
-				slog.Warn("ws queue depths", "err", err)
+				slog.Warn("ws snapshot", "tenant_id", t.ID, "err", err)
 				continue
 			}
-			counts, err := storage.CountJobsByState(ctx, s.db)
-			if err != nil {
-				slog.Warn("ws job counts", "err", err)
-				continue
-			}
-			msg, _ := json.Marshal(map[string]any{
-				"queues":        depths,
-				"jobs_by_state": counts,
-				"timestamp":     time.Now().UTC(),
-			})
-			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			if err := conn.WriteJSON(snap); err != nil {
 				return
 			}
 		}
 	}
-}
-
-// queueDepths returns Redis LLEN for every known priority+tenant combination.
-func (s *Server) queueDepths(ctx context.Context) ([]map[string]any, error) {
-	tenants, err := storage.GetTenants(ctx, s.db)
-	if err != nil {
-		return nil, err
-	}
-
-	priorities := []struct {
-		label string
-		key   string
-	}{
-		{"high", "queue:1"},
-		{"normal", "queue:5"},
-		{"low", "queue:10"},
-	}
-
-	var out []map[string]any
-	for _, t := range tenants {
-		for _, p := range priorities {
-			key := p.key + ":" + t.ID.String()
-			n, err := s.rdb.LLen(ctx, key).Result()
-			if err != nil {
-				n = 0
-			}
-			out = append(out, map[string]any{
-				"tenant_id": t.ID,
-				"tenant":    t.Name,
-				"priority":  p.label,
-				"depth":     n,
-			})
-		}
-	}
-	return out, nil
 }

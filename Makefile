@@ -19,10 +19,10 @@ migrate-drop:
 	$(MIGRATE) drop -f
 
 test-unit:
-	go test ./internal/job/... -count=1
+	go test ./... -count=1
 
 test-integration:
-	go test ./internal/storage/... -count=1 -tags integration
+	go test ./... -count=1 -p 1 -tags integration
 
 test: test-unit test-integration
 

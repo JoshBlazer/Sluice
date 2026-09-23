@@ -2,14 +2,18 @@ package storage
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sluice/internal/job"
 )
@@ -187,7 +191,7 @@ func CompleteJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID, runID u
 
 	_, err = db.Exec(ctx, `
 		UPDATE job_runs SET state = 'succeeded', finished_at = $1,
-		    duration_ms = EXTRACT(EPOCH FROM ($1 - started_at))::INT * 1000
+		    duration_ms = (EXTRACT(EPOCH FROM ($1 - started_at)) * 1000)::INT
 		WHERE id = $2`,
 		now, runID)
 	return err
@@ -222,7 +226,7 @@ func FailJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID, runID uuid.
 	var newState string
 	var runAt *time.Time
 
-	if newAttempt >= maxRetries {
+	if newAttempt > maxRetries {
 		newState = "dead"
 	} else {
 		newState = "failed"
@@ -245,7 +249,7 @@ func FailJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID, runID uuid.
 
 	_, err = tx.Exec(ctx, `
 		UPDATE job_runs SET state = $1::job_state, finished_at = $2, error = $3,
-		    duration_ms = EXTRACT(EPOCH FROM ($2 - started_at))::INT * 1000
+		    duration_ms = (EXTRACT(EPOCH FROM ($2 - started_at)) * 1000)::INT
 		WHERE id = $4`,
 		newState, now, errMsg, runID)
 	if err != nil {
@@ -309,7 +313,7 @@ func GetStaleClaims(ctx context.Context, db *pgxpool.Pool) ([]*job.Job, error) {
 
 // RequeueStaleJob handles a job whose deadline expired without a heartbeat extension.
 // It closes the open job_run, then either moves the job back to pending (if retries remain)
-// or to dead (if attempt+1 >= max_retries). Returns dead=true when the job should not be
+// or to dead (if attempt+1 > max_retries). Returns dead=true when the job should not be
 // re-enqueued because it has been routed to dead letter.
 func RequeueStaleJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID) (dead bool, err error) {
 	tx, err := db.Begin(ctx)
@@ -322,7 +326,7 @@ func RequeueStaleJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID) (de
 
 	_, err = tx.Exec(ctx, `
 		UPDATE job_runs SET state = 'failed', finished_at = $1, error = 'worker heartbeat expired',
-		    duration_ms = EXTRACT(EPOCH FROM ($1 - started_at))::INT * 1000
+		    duration_ms = (EXTRACT(EPOCH FROM ($1 - started_at)) * 1000)::INT
 		WHERE job_id = $2 AND finished_at IS NULL`,
 		now, jobID)
 	if err != nil {
@@ -332,7 +336,7 @@ func RequeueStaleJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID) (de
 	var newState string
 	err = tx.QueryRow(ctx, `
 		UPDATE jobs SET
-			state       = CASE WHEN attempt + 1 >= max_retries THEN 'dead'::job_state ELSE 'pending'::job_state END,
+			state       = CASE WHEN attempt + 1 > max_retries THEN 'dead'::job_state ELSE 'pending'::job_state END,
 			attempt     = attempt + 1,
 			claim_token = NULL,
 			claimed_at  = NULL,
@@ -357,25 +361,22 @@ func RequeueStaleJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID) (de
 	return newState == "dead", nil
 }
 
-// MoveToDeadLetter moves a dead job into the dead_letter table.
-func MoveToDeadLetter(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID) error {
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	_, err = tx.Exec(ctx, `
+// MoveToDeadLetter copies up to limit dead jobs that aren't yet in dead_letter into it.
+// Selecting only unmoved jobs matters: a plain "newest N dead jobs" scan would keep
+// re-reading already-moved rows and never reach older ones once N is exceeded.
+func MoveToDeadLetter(ctx context.Context, db *pgxpool.Pool, limit int) (int64, error) {
+	tag, err := db.Exec(ctx, `
 		INSERT INTO dead_letter (job_id, tenant_id, final_error, attempt_count, original_job)
-		SELECT id, tenant_id, last_error, attempt, to_jsonb(jobs.*)
-		FROM jobs
-		WHERE id = $1 AND state = 'dead'
-		ON CONFLICT (job_id) DO NOTHING`, jobID)
+		SELECT j.id, j.tenant_id, j.last_error, j.attempt, to_jsonb(j.*)
+		FROM jobs j
+		WHERE j.state = 'dead'
+		  AND NOT EXISTS (SELECT 1 FROM dead_letter d WHERE d.job_id = j.id)
+		LIMIT $1
+		ON CONFLICT (job_id) DO NOTHING`, limit)
 	if err != nil {
-		return fmt.Errorf("insert dead_letter: %w", err)
+		return 0, fmt.Errorf("insert dead_letter: %w", err)
 	}
-
-	return tx.Commit(ctx)
+	return tag.RowsAffected(), nil
 }
 
 type ListFilter struct {
@@ -407,9 +408,12 @@ func ListJobs(ctx context.Context, db *pgxpool.Pool, f ListFilter) ([]*job.Job, 
 	return collectJobs(rows)
 }
 
+// CancelJob marks a job that hasn't started (or is waiting out a retry backoff) as cancelled.
+// A copy already sitting in Redis is harmless: TryClaim only claims pending jobs.
 func CancelJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID, tenantID uuid.UUID) error {
 	tag, err := db.Exec(ctx, `
-		DELETE FROM jobs WHERE id = $1 AND tenant_id = $2 AND state IN ('pending', 'scheduled')`, jobID, tenantID)
+		UPDATE jobs SET state = 'cancelled', completed_at = NOW()
+		WHERE id = $1 AND tenant_id = $2 AND state IN ('pending', 'scheduled', 'failed')`, jobID, tenantID)
 	if err != nil {
 		return fmt.Errorf("cancel job: %w", err)
 	}
@@ -419,18 +423,27 @@ func CancelJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID, tenantID 
 	return nil
 }
 
-// ReplayJob resets a dead job back to pending (attempt 0) so it will be re-executed.
+// ReplayJob resets a dead job back to pending (attempt 0) so it will be re-executed,
+// and removes its dead_letter entry so a second death is recorded afresh.
 // Only jobs in 'dead' state belonging to the given tenant can be replayed.
 func ReplayJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID, tenantID uuid.UUID) (*job.Job, error) {
-	tag, err := db.Exec(ctx, `
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx, `
 		UPDATE jobs SET
-			state       = 'pending',
-			attempt     = 0,
-			last_error  = NULL,
-			claim_token = NULL,
-			claimed_at  = NULL,
-			claimed_by  = NULL,
-			deadline    = NULL
+			state        = 'pending',
+			attempt      = 0,
+			run_at       = NOW(),
+			last_error   = NULL,
+			claim_token  = NULL,
+			claimed_at   = NULL,
+			claimed_by   = NULL,
+			deadline     = NULL,
+			completed_at = NULL
 		WHERE id = $1 AND tenant_id = $2 AND state = 'dead'`,
 		jobID, tenantID)
 	if err != nil {
@@ -438,6 +451,12 @@ func ReplayJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID, tenantID 
 	}
 	if tag.RowsAffected() == 0 {
 		return nil, ErrNotFound
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM dead_letter WHERE job_id = $1`, jobID); err != nil {
+		return nil, fmt.Errorf("clear dead_letter %s: %w", jobID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit replay %s: %w", jobID, err)
 	}
 	return GetJob(ctx, db, jobID)
 }
@@ -532,12 +551,6 @@ func collectJobs(rows pgx.Rows) ([]*job.Job, error) {
 	return jobs, rows.Err()
 }
 
-// DeadState returns a pointer to job.StateDead for use in ListFilter.
-func DeadState() *job.State {
-	s := job.StateDead
-	return &s
-}
-
 func statePtr(s *job.State) *string {
 	if s == nil {
 		return nil
@@ -547,7 +560,8 @@ func statePtr(s *job.State) *string {
 }
 
 func isUniqueViolation(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "23505")
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 // EnsureJobRunsPartition creates the monthly job_runs child table for the given
@@ -572,15 +586,15 @@ func EnsureJobRunsPartition(ctx context.Context, db *pgxpool.Pool, year int, mon
 // ---------------------------------------------------------------------------
 
 type Schedule struct {
-	ID          uuid.UUID
-	TenantID    uuid.UUID
-	Name        string
-	Cron        string
-	Timezone    string
-	JobTemplate json.RawMessage
-	Enabled     bool
-	LastRunAt   *time.Time
-	NextRunAt   time.Time
+	ID          uuid.UUID       `json:"id"`
+	TenantID    uuid.UUID       `json:"tenant_id"`
+	Name        string          `json:"name"`
+	Cron        string          `json:"cron"`
+	Timezone    string          `json:"timezone"`
+	JobTemplate json.RawMessage `json:"job_template"`
+	Enabled     bool            `json:"enabled"`
+	LastRunAt   *time.Time      `json:"last_run_at,omitempty"`
+	NextRunAt   time.Time       `json:"next_run_at"`
 }
 
 func InsertSchedule(ctx context.Context, db *pgxpool.Pool, s *Schedule) error {
@@ -598,10 +612,10 @@ func InsertSchedule(ctx context.Context, db *pgxpool.Pool, s *Schedule) error {
 	return nil
 }
 
-func GetSchedule(ctx context.Context, db *pgxpool.Pool, id uuid.UUID) (*Schedule, error) {
+func GetSchedule(ctx context.Context, db *pgxpool.Pool, id uuid.UUID, tenantID uuid.UUID) (*Schedule, error) {
 	row := db.QueryRow(ctx, `
 		SELECT id, tenant_id, name, cron, timezone, job_template, enabled, last_run_at, next_run_at
-		FROM schedules WHERE id = $1`, id)
+		FROM schedules WHERE id = $1 AND tenant_id = $2`, id, tenantID)
 	return scanSchedule(row)
 }
 
@@ -686,18 +700,32 @@ func scanSchedule(row pgx.Row) (*Schedule, error) {
 type Tenant struct {
 	ID        uuid.UUID
 	Name      string
-	APIKey    string
 	RateLimit int
 	Weight    int
 	Status    string
 }
 
+// HashAPIKey returns the digest stored in tenants.api_key_hash for key.
+func HashAPIKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+// NewAPIKey returns a fresh random API key. Only its hash is ever stored.
+func NewAPIKey() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate api key: %w", err)
+	}
+	return "sk_" + base64.RawURLEncoding.EncodeToString(b), nil
+}
+
 func GetTenantByAPIKey(ctx context.Context, db *pgxpool.Pool, apiKey string) (*Tenant, error) {
 	var t Tenant
 	err := db.QueryRow(ctx, `
-		SELECT id, name, api_key, rate_limit, weight, status
-		FROM tenants WHERE api_key = $1 AND status = 'active'`, apiKey).
-		Scan(&t.ID, &t.Name, &t.APIKey, &t.RateLimit, &t.Weight, &t.Status)
+		SELECT id, name, rate_limit, weight, status
+		FROM tenants WHERE api_key_hash = $1 AND status = 'active'`, HashAPIKey(apiKey)).
+		Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -707,13 +735,48 @@ func GetTenantByAPIKey(ctx context.Context, db *pgxpool.Pool, apiKey string) (*T
 	return &t, nil
 }
 
+// InsertTenant creates an active tenant and returns its plaintext API key,
+// which is not recoverable afterwards.
+func InsertTenant(ctx context.Context, db *pgxpool.Pool, name string, rateLimit, weight int) (*Tenant, string, error) {
+	key, err := NewAPIKey()
+	if err != nil {
+		return nil, "", err
+	}
+	t := &Tenant{ID: uuid.New(), Name: name, RateLimit: rateLimit, Weight: weight, Status: "active"}
+	_, err = db.Exec(ctx, `
+		INSERT INTO tenants (id, name, api_key_hash, rate_limit, weight, status)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		t.ID, t.Name, HashAPIKey(key), t.RateLimit, t.Weight, t.Status)
+	if err != nil {
+		return nil, "", fmt.Errorf("insert tenant: %w", err)
+	}
+	return t, key, nil
+}
+
+// RotateAPIKey replaces a tenant's API key and returns the new plaintext key.
+// The old key stops working immediately.
+func RotateAPIKey(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UUID) (string, error) {
+	key, err := NewAPIKey()
+	if err != nil {
+		return "", err
+	}
+	tag, err := db.Exec(ctx, `UPDATE tenants SET api_key_hash = $1 WHERE id = $2`, HashAPIKey(key), tenantID)
+	if err != nil {
+		return "", fmt.Errorf("rotate api key: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return "", ErrNotFound
+	}
+	return key, nil
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard / stats queries
 // ---------------------------------------------------------------------------
 
-// CountJobsByState returns a map of state → count across all tenants.
-func CountJobsByState(ctx context.Context, db *pgxpool.Pool) (map[string]int64, error) {
-	rows, err := db.Query(ctx, `SELECT state::text, COUNT(*) FROM jobs GROUP BY state`)
+// CountJobsByState returns a map of state → count for one tenant.
+func CountJobsByState(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UUID) (map[string]int64, error) {
+	rows, err := db.Query(ctx, `SELECT state::text, COUNT(*) FROM jobs WHERE tenant_id = $1 GROUP BY state`, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("count jobs by state: %w", err)
 	}
@@ -744,14 +807,15 @@ type JobRun struct {
 	Error      *string    `json:"error,omitempty"`
 }
 
-func ListRecentRuns(ctx context.Context, db *pgxpool.Pool, limit int) ([]*JobRun, error) {
+func ListRecentRuns(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UUID, limit int) ([]*JobRun, error) {
 	rows, err := db.Query(ctx, `
 		SELECT jr.id, jr.job_id, jr.tenant_id, j.type, jr.attempt,
 		       jr.state::text, jr.duration_ms, jr.started_at, jr.finished_at, jr.error
 		FROM job_runs jr
 		JOIN jobs j ON j.id = jr.job_id
+		WHERE jr.tenant_id = $1
 		ORDER BY jr.started_at DESC
-		LIMIT $1`, limit)
+		LIMIT $2`, tenantID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list recent runs: %w", err)
 	}
@@ -770,19 +834,20 @@ func ListRecentRuns(ctx context.Context, db *pgxpool.Pool, limit int) ([]*JobRun
 
 // DeadLetterEntry is a single dead-letter record for dashboard display.
 type DeadLetterEntry struct {
-	JobID        uuid.UUID  `json:"job_id"`
-	TenantID     uuid.UUID  `json:"tenant_id"`
-	AttemptCount int        `json:"attempt_count"`
-	FinalError   *string    `json:"final_error,omitempty"`
-	MovedAt      time.Time  `json:"moved_at"`
+	JobID        uuid.UUID `json:"job_id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	AttemptCount int       `json:"attempt_count"`
+	FinalError   *string   `json:"final_error,omitempty"`
+	MovedAt      time.Time `json:"moved_at"`
 }
 
-func ListDeadLetter(ctx context.Context, db *pgxpool.Pool, limit int) ([]*DeadLetterEntry, error) {
+func ListDeadLetter(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UUID, limit int) ([]*DeadLetterEntry, error) {
 	rows, err := db.Query(ctx, `
 		SELECT job_id, tenant_id, attempt_count, final_error, moved_at
 		FROM dead_letter
+		WHERE tenant_id = $1
 		ORDER BY moved_at DESC
-		LIMIT $1`, limit)
+		LIMIT $2`, tenantID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list dead letter: %w", err)
 	}
@@ -802,7 +867,7 @@ func ListDeadLetter(ctx context.Context, db *pgxpool.Pool, limit int) ([]*DeadLe
 // Used by workers to build the weighted-fair-queue dequeue set.
 func GetTenants(ctx context.Context, db *pgxpool.Pool) ([]*Tenant, error) {
 	rows, err := db.Query(ctx, `
-		SELECT id, name, api_key, rate_limit, weight, status
+		SELECT id, name, rate_limit, weight, status
 		FROM tenants WHERE status = 'active'`)
 	if err != nil {
 		return nil, fmt.Errorf("get tenants: %w", err)
@@ -811,7 +876,7 @@ func GetTenants(ctx context.Context, db *pgxpool.Pool) ([]*Tenant, error) {
 	var out []*Tenant
 	for rows.Next() {
 		var t Tenant
-		if err := rows.Scan(&t.ID, &t.Name, &t.APIKey, &t.RateLimit, &t.Weight, &t.Status); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status); err != nil {
 			return nil, fmt.Errorf("scan tenant: %w", err)
 		}
 		out = append(out, &t)

@@ -3,15 +3,15 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: Sluice-scheduler
-  namespace: Sluice
+  name: sluice-scheduler
+  namespace: sluice
   labels:
-    app: Sluice-scheduler
+    app: sluice-scheduler
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: Sluice-scheduler
+      app: sluice-scheduler
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -20,15 +20,15 @@ spec:
   template:
     metadata:
       labels:
-        app: Sluice-scheduler
+        app: sluice-scheduler
     spec:
       containers:
         - name: scheduler
-          image: Sluice:latest
+          image: sluice:latest
           args: ["--role", "scheduler"]
           envFrom:
             - configMapRef:
-                name: Sluice-config
+                name: sluice-config
           resources:
             requests:
               cpu: 50m
