@@ -56,7 +56,7 @@ function Skeleton() {
             <tr key={i} className="border-b border-zinc-800/60">
               {[80, 60, 70, 30, 45, 90, 0].map((w, j) => (
                 <td key={j} className="px-4 py-3">
-                  {w > 0 && <div className="animate-pulse bg-zinc-800 rounded h-3" style={{ width: `${w}px` }} />}
+                  {w > 0 && <div className="animate-pulse bg-zinc-800 rounded-sm h-3" style={{ width: `${w}px` }} />}
                 </td>
               ))}
             </tr>
@@ -90,7 +90,7 @@ export default function RunsPage() {
           <select
             value={stateFilter}
             onChange={(e) => setStateFilter(e.target.value)}
-            className="text-xs bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-zinc-300 focus:outline-none focus:border-zinc-500 cursor-pointer"
+            className="text-xs bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-zinc-300 focus:outline-hidden focus:border-zinc-500 cursor-pointer"
           >
             <option value="">All states</option>
             <option value="succeeded">Succeeded</option>

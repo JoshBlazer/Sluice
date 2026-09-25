@@ -67,7 +67,7 @@ function RunTimeline({ jobId }: { jobId: string }) {
       {data.runs.map((r: JobRun) => (
         <li key={r.run_id} className="ml-4">
           <span
-            className={`absolute -left-[5px] mt-1.5 h-2.5 w-2.5 rounded-full ${
+            className={`absolute left-[-5px] mt-1.5 h-2.5 w-2.5 rounded-full ${
               r.state === "succeeded" ? "bg-emerald-400" : r.state === "dead" ? "bg-red-400" : r.finished_at ? "bg-amber-400" : "bg-violet-400"
             }`}
           />
@@ -135,7 +135,7 @@ export default function RetriesPage() {
           <select
             value={stateFilter}
             onChange={(e) => setStateFilter(e.target.value)}
-            className="text-xs bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-zinc-300 focus:outline-none focus:border-zinc-500 cursor-pointer"
+            className="text-xs bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-zinc-300 focus:outline-hidden focus:border-zinc-500 cursor-pointer"
           >
             {FILTERS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
           </select>

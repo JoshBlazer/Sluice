@@ -17,7 +17,7 @@ export function NavBar() {
     href === "/" ? pathname === "/" : pathname.startsWith(href);
 
   return (
-    <nav className="border-b border-zinc-800 bg-zinc-950/80 backdrop-blur-sm sticky top-0 z-10 px-6 flex items-stretch gap-1 text-sm">
+    <nav className="border-b border-zinc-800 bg-zinc-950/80 backdrop-blur-xs sticky top-0 z-10 px-6 flex items-stretch gap-1 text-sm">
       <span className="font-bold text-white mr-5 py-3.5 tracking-tight flex items-center gap-1.5 text-base">
         <span className="text-orange-400">⚡</span>
         <span>Sluice</span>
