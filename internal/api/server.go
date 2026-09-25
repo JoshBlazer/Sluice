@@ -31,6 +31,8 @@ type Server struct {
 	tenants *tenantCache
 	server  *http.Server
 	router  chi.Router
+
+	adminTokenHash []byte // set by EnableAdmin; nil disables /admin/v1
 }
 
 func New(db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter, port int) *Server {
@@ -72,11 +74,22 @@ func New(db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter, port int)
 		r.Get("/schedules", s.handleListSchedules)
 		r.Get("/schedules/{id}", s.handleGetSchedule)
 		r.Delete("/schedules/{id}", s.handleDeleteSchedule)
+		r.Patch("/schedules/{id}", s.handleUpdateSchedule)
 
 		// Dashboard data endpoints, scoped to the calling tenant.
 		r.Get("/stats", s.handleStats)
 		r.Get("/stats/runs", s.handleRecentRuns)
 		r.Get("/stats/dead-letter", s.handleDeadLetter)
+	})
+
+	r.Route("/admin/v1", func(r chi.Router) {
+		r.Use(s.adminAuth)
+		r.Post("/tenants", s.handleAdminCreateTenant)
+		r.Get("/tenants", s.handleAdminListTenants)
+		r.Get("/tenants/{id}", s.handleAdminGetTenant)
+		r.Patch("/tenants/{id}", s.handleAdminUpdateTenant)
+		r.Post("/tenants/{id}/rotate-key", s.handleAdminRotateKey)
+		r.Post("/tenants/{id}/rotate-webhook-secret", s.handleAdminRotateWebhookSecret)
 	})
 
 	s.router = r

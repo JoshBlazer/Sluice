@@ -648,6 +648,22 @@ func ListSchedules(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UUID) ([
 	return out, rows.Err()
 }
 
+// UpdateSchedule saves a schedule's cron, timezone, template, enabled flag and
+// next run time. The schedule must belong to s.TenantID.
+func UpdateSchedule(ctx context.Context, db *pgxpool.Pool, s *Schedule) error {
+	tag, err := db.Exec(ctx, `
+		UPDATE schedules SET cron = $3, timezone = $4, job_template = $5, enabled = $6, next_run_at = $7
+		WHERE id = $1 AND tenant_id = $2`,
+		s.ID, s.TenantID, s.Cron, s.Timezone, []byte(s.JobTemplate), s.Enabled, s.NextRunAt)
+	if err != nil {
+		return fmt.Errorf("update schedule: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func DeleteSchedule(ctx context.Context, db *pgxpool.Pool, id uuid.UUID, tenantID uuid.UUID) error {
 	tag, err := db.Exec(ctx, `DELETE FROM schedules WHERE id = $1 AND tenant_id = $2`, id, tenantID)
 	if err != nil {
@@ -812,6 +828,59 @@ func InsertTenant(ctx context.Context, db *pgxpool.Pool, name string, rateLimit,
 		return nil, "", fmt.Errorf("insert tenant: %w", err)
 	}
 	return t, key, nil
+}
+
+// ListAllTenants returns every tenant, active or not, by name.
+func ListAllTenants(ctx context.Context, db *pgxpool.Pool) ([]*Tenant, error) {
+	rows, err := db.Query(ctx, `
+		SELECT id, name, rate_limit, weight, status, webhook_secret, max_concurrency
+		FROM tenants ORDER BY name, id`)
+	if err != nil {
+		return nil, fmt.Errorf("list tenants: %w", err)
+	}
+	defer rows.Close()
+	out := []*Tenant{}
+	for rows.Next() {
+		var t Tenant
+		if err := rows.Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret, &t.MaxConcurrency); err != nil {
+			return nil, fmt.Errorf("scan tenant: %w", err)
+		}
+		out = append(out, &t)
+	}
+	return out, rows.Err()
+}
+
+// GetTenantAnyStatus fetches a tenant by ID whether or not it is active.
+func GetTenantAnyStatus(ctx context.Context, db *pgxpool.Pool, id uuid.UUID) (*Tenant, error) {
+	var t Tenant
+	err := db.QueryRow(ctx, `
+		SELECT id, name, rate_limit, weight, status, webhook_secret, max_concurrency
+		FROM tenants WHERE id = $1`, id).
+		Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret, &t.MaxConcurrency)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get tenant %s: %w", id, err)
+	}
+	return &t, nil
+}
+
+// SetTenantStatus enables ("active") or disables ("disabled") a tenant. A
+// disabled tenant's API key stops working and its queued jobs stop being
+// dequeued; nothing is deleted.
+func SetTenantStatus(ctx context.Context, db *pgxpool.Pool, id uuid.UUID, status string) error {
+	if status != "active" && status != "disabled" {
+		return fmt.Errorf("invalid tenant status %q", status)
+	}
+	tag, err := db.Exec(ctx, `UPDATE tenants SET status = $2 WHERE id = $1`, id, status)
+	if err != nil {
+		return fmt.Errorf("set tenant status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // TenantLimits holds optional new values for UpdateTenantLimits; nil leaves a field unchanged.

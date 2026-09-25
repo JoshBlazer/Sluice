@@ -41,6 +41,7 @@ type config struct {
 	concurrency     int
 	retentionDays   int
 	showVersion     bool
+	adminToken      string
 }
 
 func loadConfig() config {
@@ -61,6 +62,7 @@ func loadConfig() config {
 	flag.IntVar(&c.concurrency, "concurrency", envInt("SLUICE_WORKER_CONCURRENCY", worker.DefaultConcurrency), "jobs a worker runs at once (worker role only)")
 	flag.IntVar(&c.retentionDays, "retention-days", envInt("SLUICE_RETENTION_DAYS", 30), "days to keep finished jobs, run history and dead letters; 0 keeps everything (scheduler role only)")
 	flag.BoolVar(&c.webhookPrivate, "webhook-allow-private", env("SLUICE_WEBHOOK_ALLOW_PRIVATE", "") == "true", "let webhook jobs call loopback/private addresses (local dev only)")
+	flag.StringVar(&c.adminToken, "admin-token", env("SLUICE_ADMIN_TOKEN", ""), "enables the /admin/v1 tenant-management API (api role; at least 32 characters; prefer the env var)")
 	flag.BoolVar(&c.showVersion, "version", false, "print the version and exit")
 	flag.Parse()
 	return c
@@ -164,6 +166,13 @@ func startMetricsServer(port, defaultPort int) {
 
 func runAPI(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter) {
 	srv := api.New(db, q, limiter, c.httpPort)
+	if c.adminToken != "" {
+		if err := srv.EnableAdmin(c.adminToken); err != nil {
+			slog.Error("admin API", "err", err)
+			os.Exit(1)
+		}
+		slog.Info("admin API enabled at /admin/v1")
+	}
 
 	errCh := make(chan error, 1)
 	go func() {

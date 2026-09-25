@@ -42,34 +42,19 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "job_template is required")
 		return
 	}
-	var tmpl job.Template
-	if err := json.Unmarshal(req.JobTemplate, &tmpl); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid job_template")
+	if err := validateTemplate(t.ID, req.JobTemplate); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, err := tmpl.Build(t.ID, time.Now()); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid job_template: "+err.Error())
-		return
-	}
-
 	tz := req.Timezone
 	if tz == "" {
 		tz = "UTC"
 	}
-	loc, err := time.LoadLocation(tz)
+	nextRunAt, err := nextRun(req.Cron, tz)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid timezone")
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	expr, err := parser.Parse(req.Cron)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid cron expression: "+err.Error())
-		return
-	}
-
-	nextRunAt := expr.Next(time.Now().In(loc))
 
 	sched := &storage.Schedule{
 		ID:          uuid.New(),
@@ -142,4 +127,101 @@ func (s *Server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func validateTemplate(tenantID uuid.UUID, raw json.RawMessage) error {
+	var tmpl job.Template
+	if err := json.Unmarshal(raw, &tmpl); err != nil {
+		return errors.New("invalid job_template")
+	}
+	if _, err := tmpl.Build(tenantID, time.Now()); err != nil {
+		return errors.New("invalid job_template: " + err.Error())
+	}
+	return nil
+}
+
+// nextRun is the schedule's next occurrence after now, in its timezone.
+func nextRun(cronExpr, tz string) (time.Time, error) {
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return time.Time{}, errors.New("invalid timezone")
+	}
+	expr, err := cronParser.Parse(cronExpr)
+	if err != nil {
+		return time.Time{}, errors.New("invalid cron expression: " + err.Error())
+	}
+	return expr.Next(time.Now().In(loc)), nil
+}
+
+var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+
+type updateScheduleRequest struct {
+	Enabled     *bool           `json:"enabled,omitempty"`
+	Cron        *string         `json:"cron,omitempty"`
+	Timezone    *string         `json:"timezone,omitempty"`
+	JobTemplate json.RawMessage `json:"job_template,omitempty"`
+}
+
+// handleUpdateSchedule pauses, resumes or edits a schedule. Changing the cron or
+// timezone, or resuming a paused schedule, recomputes the next run from now, so
+// a schedule resumed after a pause doesn't fire a burst of missed occurrences.
+func (s *Server) handleUpdateSchedule(w http.ResponseWriter, r *http.Request) {
+	t, _ := tenant.FromContext(r.Context())
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid schedule id")
+		return
+	}
+	var req updateScheduleRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	sched, err := storage.GetSchedule(r.Context(), s.db, id, t.ID)
+	if errors.Is(err, storage.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "schedule not found")
+		return
+	}
+	if err != nil {
+		slog.Error("get schedule", "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to update schedule")
+		return
+	}
+
+	recompute := false
+	if req.Cron != nil && *req.Cron != sched.Cron {
+		sched.Cron, recompute = *req.Cron, true
+	}
+	if req.Timezone != nil && *req.Timezone != sched.Timezone {
+		sched.Timezone, recompute = *req.Timezone, true
+	}
+	if req.Enabled != nil {
+		if *req.Enabled && !sched.Enabled {
+			recompute = true
+		}
+		sched.Enabled = *req.Enabled
+	}
+	if len(req.JobTemplate) > 0 {
+		if err := validateTemplate(t.ID, req.JobTemplate); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		sched.JobTemplate = req.JobTemplate
+	}
+	if recompute {
+		next, err := nextRun(sched.Cron, sched.Timezone)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		sched.NextRunAt = next
+	}
+
+	if err := storage.UpdateSchedule(r.Context(), s.db, sched); err != nil {
+		slog.Error("update schedule", "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to update schedule")
+		return
+	}
+	writeJSON(w, http.StatusOK, sched)
 }
