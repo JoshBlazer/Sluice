@@ -37,6 +37,7 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:9099", "address for the webhook receiver")
 	callback := flag.String("callback", "", "URL workers should call (default http://<listen>/hook)")
 	wait := flag.Duration("wait", 60*time.Second, "how long to wait for all jobs to execute")
+	delay := flag.Duration("delay", 0, "how long the webhook receiver takes to respond, to simulate real work")
 	flag.Parse()
 	if *key == "" {
 		fmt.Fprintln(os.Stderr, "-key (or SLUICE_API_KEY) is required")
@@ -62,6 +63,9 @@ func main() {
 	}
 	go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { //nolint:errcheck
 		now := time.Now()
+		if *delay > 0 {
+			time.Sleep(*delay)
+		}
 		seq, err := strconv.Atoi(r.URL.Query().Get("seq"))
 		if err != nil {
 			return

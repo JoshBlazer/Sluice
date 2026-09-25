@@ -1,0 +1,49 @@
+name: Chaos
+
+# Injects faults (worker and leader kill -9, Redis data loss and restart,
+# Postgres restart, losing every Sluice process at once) while a load test runs,
+# and checks every accepted job still executes. See scripts/chaos.sh.
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 4 * * 1"   # weekly
+  pull_request:
+    paths:
+      - .github/workflows/chaos.yml
+      - scripts/chaos.sh
+      - internal/worker/**
+      - internal/scheduler/**
+      - internal/queue/**
+      - internal/storage/**
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: Start Postgres, Redis, etcd
+        run: |
+          docker compose up -d --wait postgres redis etcd
+      - name: Migrate
+        run: |
+          go install -tags 'pgx5' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+          make migrate-up
+      - name: Build
+        run: |
+          mkdir -p bin
+          go build -o bin/sluice ./cmd/sluice
+          go build -o bin/sluice-cli ./cmd/sluice-cli
+          go build -o bin/loadtest ./scripts/loadtest
+      - name: Run chaos scenarios
+        run: scripts/chaos.sh
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-logs
+          path: chaos-logs/
