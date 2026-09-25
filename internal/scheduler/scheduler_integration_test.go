@@ -213,3 +213,42 @@ func TestReconcilePending_NoDuplicatesUnderBacklog(t *testing.T) {
 		t.Fatalf("queue holds %d entries for %d waiting jobs after 3 reconcile passes, want %d", total, n, n)
 	}
 }
+
+// Redis is only a cache: if its queues are lost (flush, failover, drain), the
+// reconciler rebuilds them from Postgres and every pending job still runs.
+func TestReconcilePending_RebuildsQueuesAfterRedisLoss(t *testing.T) {
+	ctx := context.Background()
+	db := testutil.DB(t)
+	rdb := testutil.Redis(t)
+	q := queue.New(rdb)
+	tn, _ := testutil.Tenant(t, db, 0, 100)
+	s := New(db, q)
+
+	var ids []uuid.UUID
+	for i := 0; i < 3; i++ {
+		j := testutil.InsertJob(t, db, tn.ID, "https://example.com", func(j *job.Job) {
+			j.RunAt = time.Now().Add(-2 * time.Minute)
+		})
+		q.Enqueue(ctx, tn.ID, j.ID, j.Priority)
+		ids = append(ids, j.ID)
+	}
+	if err := rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	s.reconcilePending(ctx)
+
+	got := map[uuid.UUID]bool{}
+	for range ids {
+		id, err := q.Dequeue(ctx, "w1", []queue.TenantWeight{{ID: tn.ID, Weight: 1}}, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[id] = true
+	}
+	for _, id := range ids {
+		if !got[id] {
+			t.Fatalf("job %s was not re-enqueued after Redis was flushed", id)
+		}
+	}
+}
