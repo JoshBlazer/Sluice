@@ -14,9 +14,11 @@ RUN go build -ldflags "-X main.version=${VERSION}" -o /out/sluice ./cmd/sluice &
 # The migrate CLI ships in the image so deployments apply the schema that matches
 # this exact build (the Helm chart runs it as a pre-install/pre-upgrade job).
 # Built from a scratch module because `go install` can't cross-compile to a fixed path.
+ARG MIGRATE_VERSION=v4.18.1
 RUN mkdir /tmp/migrate && cd /tmp/migrate && go mod init build >/dev/null 2>&1 && \
-    go get github.com/golang-migrate/migrate/v4/cmd/migrate@v4.18.1 && \
-    go build -tags postgres -o /out/migrate github.com/golang-migrate/migrate/v4/cmd/migrate
+    go get github.com/golang-migrate/migrate/v4/cmd/migrate@${MIGRATE_VERSION} && \
+    go build -tags postgres -ldflags "-X main.Version=${MIGRATE_VERSION}" \
+      -o /out/migrate github.com/golang-migrate/migrate/v4/cmd/migrate
 
 FROM gcr.io/distroless/static:nonroot
 COPY --from=builder /out/sluice /sluice

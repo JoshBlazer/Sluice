@@ -21,7 +21,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// The job's execution must join the trace of the API request that submitted it.
+// The job's execution, and the webhook request it sends, must join the trace of
+// the API request that submitted the job.
 func TestTracePropagatesFromSubmissionToExecution(t *testing.T) {
 	rec := tracetest.NewSpanRecorder()
 	prevTP, prevProp := otel.GetTracerProvider(), otel.GetTextMapPropagator()
@@ -32,7 +33,13 @@ func TestTracePropagatesFromSubmissionToExecution(t *testing.T) {
 	e := newEnv(t)
 	db := testutil.DB(t)
 	_, key := testutil.Tenant(t, db, 0, 100)
-	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	received := make(chan string, 1)
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case received <- r.Header.Get("traceparent"):
+		default:
+		}
+	}))
 	defer hook.Close()
 
 	w := worker.New(db, e.q, worker.Options{AllowPrivateWebhooks: true})
@@ -75,5 +82,11 @@ func TestTracePropagatesFromSubmissionToExecution(t *testing.T) {
 	}
 	if workerSpan.Parent().SpanID() != apiSpan.SpanContext().SpanID() {
 		t.Fatalf("worker span's parent is %s, want the submission span %s", workerSpan.Parent().SpanID(), apiSpan.SpanContext().SpanID())
+	}
+
+	tp := <-received
+	want := apiSpan.SpanContext().TraceID().String()
+	if len(tp) != 55 || tp[3:35] != want {
+		t.Fatalf("webhook traceparent = %q, want trace ID %s", tp, want)
 	}
 }
