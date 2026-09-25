@@ -17,8 +17,10 @@ import (
 const failoverTarget = 2 * time.Second
 
 // crashFailoverLimit allows for lease expiry: a crashed leader holds its lease for
-// up to DefaultTTLSeconds after its last keepalive (measured 1.5-2.1s locally).
-const crashFailoverLimit = 2500 * time.Millisecond
+// up to DefaultTTLSeconds after its last keepalive, and etcd sweeps expired leases
+// every 500ms. Measured 1.5-2.6s depending on load. The limit catches regressions
+// (the old 5s lease took ~5s), not scheduling noise.
+const crashFailoverLimit = 3 * time.Second
 
 func client(t *testing.T) *clientv3.Client {
 	t.Helper()

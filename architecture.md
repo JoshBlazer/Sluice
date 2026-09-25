@@ -113,7 +113,7 @@ The leader's responsibilities:
 
 4. **Dead-letter promotion**: jobs that exceed their max_retries get moved from active tables to the `dead_letter` table for inspection.
 
-Non-leader replicas are hot standbys. They keep their database connection pool warm and run periodic health checks against Postgres and Redis. A leader that shuts down resigns, and a standby takes over in about 50ms. A leader that crashes keeps its lease until it expires, so takeover takes 1.5–2.1 seconds (measured by `internal/leader` integration tests). A short lease can briefly produce two leaders after a long pause; every scheduler loop tolerates that (conditional updates, idempotent enqueue, cron idempotency keys).
+Non-leader replicas are hot standbys. They keep their database connection pool warm and run periodic health checks against Postgres and Redis. A leader that shuts down resigns, and a standby takes over in about 50ms. A leader that crashes keeps its lease until it expires, so takeover takes 1.5–2.6 seconds depending on load (measured by `internal/leader` integration tests; etcd checks for expired leases every 500ms, which sets the floor). A short lease can briefly produce two leaders after a long pause; every scheduler loop tolerates that (conditional updates, idempotent enqueue, cron idempotency keys).
 
 ### Worker Service
 

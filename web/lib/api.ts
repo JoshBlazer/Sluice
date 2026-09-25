@@ -1,15 +1,16 @@
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
-export const API_TOKEN = process.env.NEXT_PUBLIC_API_TOKEN ?? "dev-token";
+import { getToken, UNAUTHORIZED_EVENT } from "./auth";
+import { API_BASE } from "./config";
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     headers: {
-      Authorization: `Bearer ${API_TOKEN}`,
+      Authorization: `Bearer ${getToken() ?? ""}`,
       "Content-Type": "application/json",
     },
     cache: "no-store",
     ...options,
   });
+  if (res.status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
   if (!res.ok) throw new Error(`${path} → ${res.status}`);
   return res.json();
 }

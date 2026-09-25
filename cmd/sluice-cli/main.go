@@ -61,6 +61,8 @@ func main() {
 		cmdRotateKey(ctx, db, flag.Args()[1:])
 	case "rotate-webhook-secret":
 		cmdRotateWebhookSecret(ctx, db, flag.Args()[1:])
+	case "enable-dev-tenant":
+		cmdEnableDevTenant(ctx, db)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", flag.Arg(0))
 		usage()
@@ -221,6 +223,25 @@ func cmdCreateTenant(ctx context.Context, db *pgxpool.Pool, args []string) {
 		"Store the API key now — only its hash is kept. The webhook secret verifies Sluice's\n"+
 		"requests to your endpoints; it can be fetched later from GET /v1/webhook-secret.\n",
 		t.ID, key, t.WebhookSecret)
+}
+
+// cmdEnableDevTenant re-enables the seeded local-development tenant, whose API
+// key is the public string "dev-token". Migrations disable it on every database.
+func cmdEnableDevTenant(ctx context.Context, db *pgxpool.Pool) {
+	secret, err := storage.NewWebhookSecret()
+	if err != nil {
+		fatalf("%v", err)
+	}
+	_, err = db.Exec(ctx, `
+		INSERT INTO tenants (id, name, api_key_hash, rate_limit, status, webhook_secret)
+		VALUES ('00000000-0000-0000-0000-000000000001', 'dev', $1, 1000, 'active', $2)
+		ON CONFLICT (id) DO UPDATE SET status = 'active', api_key_hash = EXCLUDED.api_key_hash`,
+		storage.HashAPIKey("dev-token"), secret)
+	if err != nil {
+		fatalf("enable dev tenant: %v", err)
+	}
+	fmt.Println("dev tenant enabled; its API key is \"dev-token\".")
+	fmt.Println("WARNING: anyone can use that key. Only do this on a local development database.")
 }
 
 func cmdRotateWebhookSecret(ctx context.Context, db *pgxpool.Pool, args []string) {
@@ -429,6 +450,8 @@ Commands:
   rotate-key <id>     issue a new API key for a tenant, revoking the old one
   rotate-webhook-secret <id>
                       issue a new webhook signing secret for a tenant
+  enable-dev-tenant   LOCAL DEVELOPMENT ONLY: enable the "dev" tenant whose
+                      API key is the public string "dev-token"
 
 Flags:`)
 	flag.PrintDefaults()
