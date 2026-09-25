@@ -350,7 +350,7 @@ Each tenant has:
 - A unique `tenant_id`
 - One or more API keys with scoped permissions (submit, query, admin)
 - A configurable rate limit (jobs/sec submitted) enforced via a Redis token bucket
-- A configurable concurrency limit (max concurrent running jobs) enforced via a Postgres counter
+- A configurable concurrency limit (`max_concurrency`, max jobs running at once). For a capped tenant, claims lock the tenant's row and count its running jobs in a fresh statement before claiming, so concurrent workers can't overshoot the cap. A worker that finds a tenant at its cap puts the job back and skips that tenant for 250ms. Uncapped tenants take the ordinary lock-free claim path
 
 Within a priority lane, queue selection uses **weighted round-robin** across active tenants. Each tenant has a weight (default 100); when a worker pops from the queue, the worker iterates tenants in proportion to their weight. This prevents one tenant from monopolizing workers.
 

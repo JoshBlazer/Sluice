@@ -2,9 +2,11 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,6 +59,8 @@ type Worker struct {
 	tenantsMu sync.RWMutex
 	tenants   []queue.TenantWeight
 	secrets   map[uuid.UUID]string // tenant ID -> webhook signing secret
+	limits    map[uuid.UUID]int    // tenant ID -> max_concurrency (absent or 0: unlimited)
+	throttled map[uuid.UUID]time.Time
 }
 
 func New(db *pgxpool.Pool, q *queue.Queue, opts Options) *Worker {
@@ -71,6 +75,7 @@ func New(db *pgxpool.Pool, q *queue.Queue, opts Options) *Worker {
 		db:          db,
 		queue:       q,
 		http:        newWebhookClient(opts.AllowPrivateWebhooks),
+		throttled:   map[uuid.UUID]time.Time{},
 		shutdown:    make(chan struct{}),
 		done:        make(chan struct{}),
 		reload:      make(chan struct{}, 1),
@@ -140,11 +145,7 @@ func (w *Worker) Run(ctx context.Context) {
 // Concurrency of these.
 func (w *Worker) loop(pollCtx context.Context) {
 	for pollCtx.Err() == nil {
-		w.tenantsMu.RLock()
-		tenants := w.tenants
-		w.tenantsMu.RUnlock()
-
-		item, err := w.queue.Pop(pollCtx, w.id, tenants, dequeueTimeout)
+		item, err := w.queue.Pop(pollCtx, w.id, w.dequeueTenants(), dequeueTimeout)
 		if err != nil {
 			if pollCtx.Err() != nil {
 				return
@@ -197,8 +198,12 @@ func (w *Worker) loadTenants(ctx context.Context) {
 	}
 	weights := make([]queue.TenantWeight, len(tenants))
 	secrets := make(map[uuid.UUID]string, len(tenants))
+	limits := make(map[uuid.UUID]int, len(tenants))
 	for i, t := range tenants {
 		secrets[t.ID] = t.WebhookSecret
+		if t.MaxConcurrency > 0 {
+			limits[t.ID] = t.MaxConcurrency
+		}
 		w := t.Weight
 		if w <= 0 {
 			w = 100
@@ -208,12 +213,53 @@ func (w *Worker) loadTenants(ctx context.Context) {
 	w.tenantsMu.Lock()
 	w.tenants = weights
 	w.secrets = secrets
+	w.limits = limits
 	w.tenantsMu.Unlock()
 	slog.Info("tenant weights loaded", "count", len(weights))
 }
 
 // process claims and executes one popped job. It returns false if the claim hit a
 // database error, after putting the job back on its queue.
+// throttleFor is how long a worker skips a tenant after finding it at its
+// concurrency limit, so it doesn't keep popping and putting back that tenant's jobs.
+const throttleFor = 250 * time.Millisecond
+
+// dequeueTenants is the tenant list minus tenants this worker recently found at
+// their concurrency limit.
+func (w *Worker) dequeueTenants() []queue.TenantWeight {
+	w.tenantsMu.RLock()
+	defer w.tenantsMu.RUnlock()
+	now := time.Now()
+	out := make([]queue.TenantWeight, 0, len(w.tenants))
+	for _, t := range w.tenants {
+		if until, ok := w.throttled[t.ID]; ok && now.Before(until) {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+func (w *Worker) throttle(tenantID uuid.UUID) {
+	w.tenantsMu.Lock()
+	w.throttled[tenantID] = time.Now().Add(throttleFor)
+	w.tenantsMu.Unlock()
+}
+
+// claim uses the concurrency-limited claim for tenants with a cap. The tenant
+// comes from the queue list the job was popped from ("queue:<p>:<tenant>").
+func (w *Worker) claim(ctx context.Context, item queue.Item, token uuid.UUID, deadline time.Time) (*job.Job, uuid.UUID, error) {
+	if tenantID, err := uuid.Parse(item.List[strings.LastIndex(item.List, ":")+1:]); err == nil {
+		w.tenantsMu.RLock()
+		limit := w.limits[tenantID]
+		w.tenantsMu.RUnlock()
+		if limit > 0 {
+			return storage.TryClaimLimited(ctx, w.db, item.JobID, tenantID, limit, w.id, token, deadline)
+		}
+	}
+	return storage.TryClaim(ctx, w.db, item.JobID, w.id, token, deadline)
+}
+
 // webhookSecret returns the tenant's signing secret from the refreshed cache,
 // falling back to Postgres for a tenant created since the last refresh.
 func (w *Worker) webhookSecret(ctx context.Context, tenantID uuid.UUID) (string, error) {
@@ -243,7 +289,20 @@ func (w *Worker) process(ctx context.Context, item queue.Item) bool {
 	// reaped within HeartbeatTTL plus one reaper interval.
 	deadline := time.Now().Add(queue.HeartbeatTTL)
 
-	j, runID, err := storage.TryClaim(ctx, w.db, jobID, w.id, token, deadline)
+	j, runID, err := w.claim(ctx, item, token, deadline)
+	if errors.Is(err, storage.ErrConcurrencyLimit) {
+		// Not a failure: the tenant is busy. Put the job back for later and skip
+		// this tenant briefly so other tenants' jobs get this slot.
+		tenantID := item.List[strings.LastIndex(item.List, ":")+1:]
+		metrics.TenantThrottledTotal.WithLabelValues(tenantID).Inc()
+		if tid, perr := uuid.Parse(tenantID); perr == nil {
+			w.throttle(tid)
+		}
+		if err := w.queue.Requeue(context.WithoutCancel(ctx), item); err != nil {
+			telemetry.L(ctx).Error("requeue throttled job", "job_id", jobID, "err", err)
+		}
+		return true
+	}
 	if err != nil {
 		telemetry.L(ctx).Error("claim failed", "job_id", jobID, "err", err)
 		span.RecordError(err)

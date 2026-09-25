@@ -5,6 +5,8 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -271,5 +273,63 @@ func TestAPIKeys(t *testing.T) {
 	}
 	if _, err := storage.GetTenantByAPIKey(ctx, db, newKey); err != nil {
 		t.Fatalf("new key: %v", err)
+	}
+}
+
+// Concurrent claims must never push a tenant past max_concurrency: the tenant row
+// lock serializes them and each counts running jobs after acquiring it.
+func TestTryClaimLimited_NeverExceedsLimit(t *testing.T) {
+	ctx := context.Background()
+	db := testutil.DB(t)
+	tn, _ := testutil.Tenant(t, db, 0, 100)
+	const limit, attempts = 3, 10
+
+	jobs := make([]*job.Job, attempts)
+	for i := range jobs {
+		jobs[i] = testutil.InsertJob(t, db, tn.ID, "https://example.com", nil)
+	}
+
+	var claimed, limited atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for _, j := range jobs {
+		wg.Add(1)
+		go func(id uuid.UUID) {
+			defer wg.Done()
+			<-start
+			got, _, err := storage.TryClaimLimited(ctx, db, id, tn.ID, limit, "w", uuid.New(), time.Now().Add(time.Minute))
+			switch {
+			case errors.Is(err, storage.ErrConcurrencyLimit):
+				limited.Add(1)
+			case err != nil:
+				t.Errorf("claim: %v", err)
+			case got != nil:
+				claimed.Add(1)
+			}
+		}(j.ID)
+	}
+	close(start)
+	wg.Wait()
+
+	if claimed.Load() != limit || limited.Load() != attempts-limit {
+		t.Fatalf("claimed %d, limited %d; want exactly %d claimed and %d limited",
+			claimed.Load(), limited.Load(), limit, attempts-limit)
+	}
+}
+
+func TestUpdateTenantLimits(t *testing.T) {
+	ctx := context.Background()
+	db := testutil.DB(t)
+	tn, _ := testutil.Tenant(t, db, 50, 100)
+	five := 5
+	got, err := storage.UpdateTenantLimits(ctx, db, tn.ID, storage.TenantLimits{MaxConcurrency: &five})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MaxConcurrency != 5 || got.RateLimit != 50 || got.Weight != 100 {
+		t.Fatalf("got %+v; want only max_concurrency changed", got)
+	}
+	if _, err := storage.UpdateTenantLimits(ctx, db, uuid.New(), storage.TenantLimits{MaxConcurrency: &five}); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("unknown tenant: err = %v, want ErrNotFound", err)
 	}
 }
