@@ -10,3 +10,4 @@ data:
   SLUICE_REDIS_ADDR: {{ .Values.redis.addr | quote }}
   SLUICE_ETCD_ENDPOINTS: {{ .Values.etcd.endpoints | quote }}
   SLUICE_PORT: {{ .Values.api.port | quote }}
+  SLUICE_RETENTION_DAYS: {{ .Values.scheduler.retentionDays | quote }}

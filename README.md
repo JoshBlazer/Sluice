@@ -180,6 +180,7 @@ Jobs are **webhooks**: an HTTP request (`GET`, `POST`, `PUT`, `PATCH` or `DELETE
 - **Graceful shutdown**: workers drain in-flight jobs before exiting; any still running at the timeout are aborted and recorded as failed attempts
 - **Hot config reload**: SIGHUP makes workers reload tenant weights immediately (they also refresh every 60s); rate-limit changes apply on the next request
 - **Admin CLI**: create tenants, rotate keys, replay dead-letter jobs, drain queues, force-fail stuck jobs, dump scheduler state
+- **Bounded storage**: finished jobs, run history and dead letters are pruned after a configurable retention period (default 30 days), in small batches
 - **Backup-friendly**: Postgres is the source of truth; standard backup tooling applies
 
 ---
@@ -317,6 +318,7 @@ Every flag can also be set by environment variable:
 | `SLUICE_PORT` | `--port` | `8080` (api) |
 | `SLUICE_METRICS_PORT` | `--metrics-port` | `9091` (scheduler), `9092` (worker) |
 | `SLUICE_WORKER_CONCURRENCY` | `--concurrency` | `10`. Jobs each worker process runs at once. Workers size their Postgres pool to `concurrency + 4` unless the URL sets `pool_max_conns`. Keep the total across all API, worker and scheduler processes under Postgres's `max_connections` (100 by default) |
+| `SLUICE_RETENTION_DAYS` | `--retention-days` | `30`. The scheduler deletes succeeded and cancelled jobs, their run history and dead-letter entries once they are this old, and drops expired monthly `job_runs` partitions. Pending, scheduled, running and retrying jobs are never deleted. `0` keeps everything. A pruned job's idempotency key can be reused |
 | `SLUICE_WEBHOOK_ALLOW_PRIVATE` | `--webhook-allow-private` | `false`. When false, webhooks to loopback, private, link-local (cloud metadata) and other non-public addresses are refused |
 | | `--shutdown-timeout` | `30s`. How long a stopping worker waits for its in-flight job before aborting it |
 
