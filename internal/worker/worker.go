@@ -212,21 +212,13 @@ func (w *Worker) process(ctx context.Context, jobID uuid.UUID) {
 	// reaped within HeartbeatTTL plus one reaper interval.
 	deadline := time.Now().Add(queue.HeartbeatTTL)
 
-	ok, runID, err := storage.TryClaim(ctx, w.db, jobID, w.id, token, deadline)
+	j, runID, err := storage.TryClaim(ctx, w.db, jobID, w.id, token, deadline)
 	if err != nil {
 		telemetry.L(ctx).Error("claim failed", "job_id", jobID, "err", err)
 		span.RecordError(err)
 		return
 	}
-	if !ok {
-		return
-	}
-
-	j, err := storage.GetJob(ctx, w.db, jobID)
-	if err != nil {
-		// The claim stands; the stale-claim reaper requeues the job once its deadline passes.
-		telemetry.L(ctx).Error("get job after claim", "job_id", jobID, "err", err)
-		span.RecordError(err)
+	if j == nil {
 		return
 	}
 
@@ -235,10 +227,6 @@ func (w *Worker) process(ctx context.Context, jobID uuid.UUID) {
 		attribute.String("job.tenant_id", j.TenantID.String()),
 		attribute.Int("job.attempt", j.Attempt),
 	)
-
-	if err := storage.MarkRunning(ctx, w.db, jobID, token); err != nil {
-		telemetry.L(ctx).Warn("mark running", "job_id", jobID, "err", err)
-	}
 
 	metrics.WorkerInFlight.Inc()
 	hbCtx, hbCancel := context.WithCancel(ctx)

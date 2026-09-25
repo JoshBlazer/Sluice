@@ -170,7 +170,7 @@ func runScheduler(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queu
 	}
 	defer etcdClient.Close()
 
-	elect := leader.New(etcdClient, "/sluice/scheduler/leader", 5)
+	elect := leader.New(etcdClient, "/sluice/scheduler/leader", leader.DefaultTTLSeconds)
 	s := scheduler.New(db, q)
 	s.Run(ctx, elect)
 }

@@ -8,6 +8,7 @@ package testutil
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/sluice/internal/job"
 	"github.com/sluice/internal/storage"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // redisTestDB keeps test keys out of the dev queues in DB 0.
@@ -129,4 +131,25 @@ func Eventually(t testing.TB, timeout time.Duration, msg string, cond func() boo
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("timed out after %s waiting for: %s", timeout, msg)
+}
+
+// EtcdEndpoints returns the test etcd endpoints after checking one is reachable.
+func EtcdEndpoints(t testing.TB) []string {
+	t.Helper()
+	ep := os.Getenv("SLUICE_TEST_ETCD_ENDPOINTS")
+	if ep == "" {
+		ep = "localhost:2379"
+	}
+	endpoints := strings.Split(ep, ",")
+	c, err := clientv3.New(clientv3.Config{Endpoints: endpoints, DialTimeout: 3 * time.Second})
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, err = c.Status(ctx, endpoints[0])
+		cancel()
+		c.Close()
+	}
+	if err != nil {
+		unavailable(t, "etcd", err)
+	}
+	return endpoints
 }

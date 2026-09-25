@@ -105,9 +105,9 @@ func TestCrashedWorkerJobIsReassigned(t *testing.T) {
 
 	j := testutil.InsertJob(t, db, tn.ID, srv.URL, nil)
 	// The "crashed" worker: claims with the same initial deadline a real worker uses.
-	ok, _, err := storage.TryClaim(ctx, db, j.ID, "dead-worker", uuid.New(), time.Now().Add(queue.HeartbeatTTL))
-	if err != nil || !ok {
-		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	claimed, _, err := storage.TryClaim(ctx, db, j.ID, "dead-worker", uuid.New(), time.Now().Add(queue.HeartbeatTTL))
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: claimed=%v err=%v", claimed != nil, err)
 	}
 	crashedAt := time.Now()
 

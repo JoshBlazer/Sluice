@@ -28,7 +28,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "missing api key")
 		return
 	}
-	t, err := storage.GetTenantByAPIKey(r.Context(), s.db, key)
+	t, err := s.tenants.lookup(r.Context(), key)
 	if err != nil {
 		if err != storage.ErrNotFound {
 			slog.Error("ws tenant lookup", "err", err)

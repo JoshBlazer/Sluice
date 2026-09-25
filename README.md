@@ -88,7 +88,7 @@ API keys are stored only as SHA-256 hashes. Create a tenant and get its key with
 
 ```bash
 go run ./cmd/sluice-cli create-tenant -rate-limit 200 -weight 100 acme
-go run ./cmd/sluice-cli rotate-key <tenant-id>   # revokes the old key
+go run ./cmd/sluice-cli rotate-key <tenant-id>   # revokes the old key (API replicas cache keys for up to 10s)
 ```
 
 `dev-token` is seeded by the migrations for local use only. Before any real deployment, disable it: `UPDATE tenants SET status = 'disabled' WHERE name = 'dev';`
@@ -178,7 +178,7 @@ Design targets on a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, Redis 
 | Submission throughput | 10,000+ jobs/sec |
 | End-to-end latency (p50) | < 10 ms (submit → pickup) |
 | End-to-end latency (p99) | < 50 ms (submit → pickup) |
-| Scheduler failover | < 2 seconds (leader → hot standby) |
+| Scheduler failover | < 2 seconds (leader → hot standby); measured ~50ms on shutdown, 1.5–2.1s after a crash (lease expiry) |
 | Recovery from full node loss | < 30 seconds (all in-flight jobs) |
 
 These are design targets, not measured results. `scripts/loadtest` measures submission throughput and submit→execute latency against a running stack; see [Load testing](#load-testing).
