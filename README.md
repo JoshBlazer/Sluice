@@ -214,15 +214,15 @@ Design targets are for a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, R
 
 | Metric | Target (3 nodes) | Measured (1 shared 4-vCPU runner) |
 |--------|--------|----------|
-| Submission throughput | 10,000+ jobs/sec | 2,550 jobs/sec; not yet run on target hardware |
-| Execution throughput | — | 1,686 jobs/sec (20,000 jobs in 11.9 s, 0 duplicate executions) |
-| Latency p50 (submit → execute) | < 10 ms | 0.65 ms |
-| Latency p99 (submit → execute) | < 50 ms | 2.9 ms |
+| Submission throughput | 10,000+ jobs/sec | 1,550–3,500 jobs/sec; not yet run on target hardware |
+| Execution throughput | — | 1,200–2,500 jobs/sec (20,000 jobs, 0 duplicate executions) |
+| Latency p50 (submit → execute) | < 10 ms | 0.6–1.0 ms |
+| Latency p99 (submit → execute) | < 50 ms | 2.8–8 ms (one noisy run: 65 ms) |
 | Scheduler failover | < 2 seconds | ~50 ms on shutdown; 1.5–2.6 s after a crash, bounded by etcd lease expiry (checked in CI) |
 | Worker crash recovery | — | < 20 seconds (checked in CI) |
 | Recovery from full node loss | < 30 seconds | 17 s: every Sluice process killed with 3,000 jobs in flight, none lost ([chaos tests](#failure-mode-tests)) |
 
-`scripts/loadtest` reproduces the throughput and latency measurements against any running stack; see [Load testing](#load-testing).
+Throughput is given as a range because GitHub assigns runners with different CPU models, and the same code measures up to 2x apart between them; the benchmark now logs which CPU it ran on. `scripts/loadtest` reproduces the throughput and latency measurements against any running stack; see [Load testing](#load-testing).
 
 ---
 
