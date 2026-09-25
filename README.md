@@ -327,8 +327,11 @@ Every flag can also be set by environment variable:
 |----------|------|---------|
 | `SLUICE_ROLE` | `--role` | (required) `api`, `scheduler` or `worker` |
 | `SLUICE_POSTGRES_URL` | `--postgres-url` | `postgres://sluice:sluice@localhost:5433/sluice?sslmode=disable` |
-| `SLUICE_REDIS_ADDR` | `--redis-addr` | `localhost:6379` |
-| `SLUICE_ETCD_ENDPOINTS` | `--etcd-endpoints` | `localhost:2379` |
+| `SLUICE_REDIS_ADDR` | `--redis-addr` | `localhost:6379`. For auth, a database number or TLS, use a URL: `redis://user:pass@host:6379/0`, or `rediss://…` for TLS |
+| `SLUICE_ETCD_ENDPOINTS` | `--etcd-endpoints` | `localhost:2379` (scheduler role only) |
+| `SLUICE_ETCD_USERNAME` / `SLUICE_ETCD_PASSWORD` | `--etcd-username` / `--etcd-password` | unset. etcd user auth |
+| `SLUICE_ETCD_CA_FILE` | `--etcd-ca-file` | unset. CA that signs the etcd server certificate; enables TLS |
+| `SLUICE_ETCD_CERT_FILE` / `SLUICE_ETCD_KEY_FILE` | `--etcd-cert-file` / `--etcd-key-file` | unset. Client certificate for etcd mutual TLS |
 | `SLUICE_OTLP_ENDPOINT` | `--otlp-endpoint` | `localhost:4318` |
 | `SLUICE_PORT` | `--port` | `8080` (api) |
 | `SLUICE_METRICS_PORT` | `--metrics-port` | `9091` (scheduler), `9092` (worker) |
@@ -385,8 +388,11 @@ The chart expects Postgres, Redis and etcd to exist already, and migrations to h
 ```bash
 helm install sluice deploy/helm \
   --set postgres.url="postgres://sluice:$PG_PASSWORD@postgres:5432/sluice?sslmode=require" \
+  --set redis.addr="rediss://:$REDIS_PASSWORD@redis:6380/0" \
   --set worker.replicas=10
 ```
+
+Connection strings and passwords go into a Kubernetes Secret, never the ConfigMap. To use a Secret you manage yourself, set `existingSecret` to its name (keys `SLUICE_POSTGRES_URL`, `SLUICE_REDIS_ADDR`, optionally `SLUICE_ETCD_PASSWORD`). For etcd over TLS, set `etcd.tls.secretName` to a Secret holding `ca.crt` (plus `tls.crt`/`tls.key` with `etcd.tls.clientCert=true`); it is mounted into scheduler pods.
 
 Worker autoscaling uses a KEDA `ScaledObject` on `sum(sluice_queue_depth)`, which the scheduler leader exports. It needs KEDA installed and a Prometheus that scrapes the scheduler (`worker.autoscaling.prometheusAddress`); set `worker.autoscaling.enabled=false` otherwise.
 

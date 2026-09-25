@@ -22,7 +22,7 @@ const crashFailoverLimit = 2500 * time.Millisecond
 
 func client(t *testing.T) *clientv3.Client {
 	t.Helper()
-	c, err := leader.NewClient(testutil.EtcdEndpoints(t))
+	c, err := leader.NewClient(leader.ClientConfig{Endpoints: testutil.EtcdEndpoints(t)})
 	if err != nil {
 		t.Fatal(err)
 	}

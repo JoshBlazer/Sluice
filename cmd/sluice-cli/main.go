@@ -34,7 +34,10 @@ func main() {
 	}
 	defer db.Close()
 
-	rdb := redis.NewClient(&redis.Options{Addr: *redisAddr})
+	rdb, err := queue.NewClient(*redisAddr)
+	if err != nil {
+		fatalf("configure redis: %v", err)
+	}
 	defer rdb.Close()
 
 	q := queue.New(rdb)
