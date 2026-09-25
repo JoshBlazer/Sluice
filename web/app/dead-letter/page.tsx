@@ -57,7 +57,7 @@ function Skeleton() {
             <tr key={i} className="border-b border-zinc-800/60">
               {[80, 80, 40, 60, 140, 60].map((w, j) => (
                 <td key={j} className="px-4 py-3">
-                  <div className="animate-pulse bg-zinc-800 rounded h-3" style={{ width: `${w}px` }} />
+                  <div className="animate-pulse bg-zinc-800 rounded-sm h-3" style={{ width: `${w}px` }} />
                 </td>
               ))}
             </tr>
