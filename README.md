@@ -18,7 +18,7 @@ Most teams reach for either a Redis-only queue (fast but loses jobs on crash) or
 - **Durable by default** — jobs survive crashes, network partitions, and worker death. A crashed worker's job is picked up again within 20 seconds
 - **At-least-once delivery, without double-writes** — a stalled worker that wakes up after its job was reassigned can't overwrite the new result, and idempotency keys deduplicate submissions
 - **Scheduler HA** — leader election via etcd with hot standbys. Failover takes ~50ms on shutdown and ~2s after a crash, and two leaders overlapping briefly can't double-run anything
-- **Multi-tenant and secure** — per-tenant rate limits, weighted fair queuing, isolated data, hashed API keys, and webhooks that refuse to call internal addresses
+- **Multi-tenant and secure** — per-tenant rate limits, weighted fair queuing, isolated data, hashed API keys, signed webhooks ([Standard Webhooks](https://www.standardwebhooks.com/)), and webhooks that refuse to call internal addresses
 - **High throughput** — designed for 10k+ jobs/sec; workers run many jobs concurrently
 - **Observable** — Prometheus metrics, OpenTelemetry traces, structured logs on every code path
 - **Operable** — graceful shutdown that finishes in-flight jobs, hot config reload, admin CLI for incident response
@@ -135,7 +135,7 @@ Full design and trade-offs are documented in [architecture.md](architecture.md).
 
 ### Jobs
 
-Jobs are **webhooks**: an HTTP request (`GET`, `POST`, `PUT`, `PATCH` or `DELETE`) with optional headers and body. Any status below 400 counts as success. Each job runs on one of three timings:
+Jobs are **webhooks**: an HTTP request (`GET`, `POST`, `PUT`, `PATCH` or `DELETE`) with optional headers and body. Any status below 400 counts as success. `timeout_seconds` (1–900, default 25) bounds each attempt. Every request is signed so the receiver can verify it came from Sluice (see [Verifying webhooks](#verifying-webhooks)). Each job runs on one of three timings:
 
 | Timing | Use Case | Example |
 |--------|----------|---------|
@@ -165,6 +165,21 @@ Jobs are **webhooks**: an HTTP request (`GET`, `POST`, `PUT`, `PATCH` or `DELETE
 
 - **SSRF protection** — webhooks refuse loopback, private, link-local (e.g. cloud metadata at `169.254.169.254`) and other non-public addresses. The check runs on the resolved IP when connecting, so it also blocks redirects and DNS rebinding
 - **Hashed API keys** — only SHA-256 digests are stored; `sluice-cli` issues and rotates keys
+- **Signed webhooks** — every request carries [Standard Webhooks](https://www.standardwebhooks.com/) headers (`webhook-id`, `webhook-timestamp`, `webhook-signature`, an HMAC-SHA256 with the tenant's secret), which a job's own headers can't override
+
+### Verifying webhooks
+
+Each tenant has a signing secret (`whsec_…`), shown by `sluice-cli create-tenant` and available from `GET /v1/webhook-secret`. Verify requests with any [Standard Webhooks library](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries), for example in Node:
+
+```js
+import { Webhook } from "standardwebhooks";
+
+const wh = new Webhook(process.env.SLUICE_WEBHOOK_SECRET);
+// Throws if the signature is invalid or the timestamp is too old.
+const payload = wh.verify(rawBody, request.headers);
+```
+
+`webhook-id` is the job ID and stays the same across retries, so receivers can use it to deduplicate at-least-once deliveries. `sluice-cli rotate-webhook-secret <tenant-id>` issues a new secret; workers switch to it within a minute (or immediately after SIGHUP), so accept both secrets briefly while rotating.
 - **Validated input** — job payloads, priorities, retry limits, cron templates and request sizes are checked at the API boundary
 
 ### Observability
@@ -410,6 +425,7 @@ sluice-cli queue-depth
 # Create a tenant (prints its API key once) / replace a tenant's key
 sluice-cli create-tenant [-rate-limit N] [-weight N] <name>
 sluice-cli rotate-key <tenant-id>
+sluice-cli rotate-webhook-secret <tenant-id>
 ```
 
 ---

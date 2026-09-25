@@ -54,6 +54,8 @@ func New(db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter, port int)
 		r.Post("/jobs/{id}/cancel", s.handleCancelJob)
 		r.Post("/jobs/{id}/replay", s.handleReplayJob)
 
+		r.Get("/webhook-secret", s.handleWebhookSecret)
+
 		r.Post("/schedules", s.handleCreateSchedule)
 		r.Get("/schedules", s.handleListSchedules)
 		r.Get("/schedules/{id}", s.handleGetSchedule)

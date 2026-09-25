@@ -328,3 +328,18 @@ func TestRetryHistory(t *testing.T) {
 		t.Fatalf("other tenant reading runs: %d, want 404", code)
 	}
 }
+
+func TestWebhookSecretEndpoint(t *testing.T) {
+	e := newEnv(t)
+	tn, key := testutil.Tenant(t, testutil.DB(t), 0, 100)
+	code, body := e.do("GET", "/v1/webhook-secret", key, nil)
+	if code != http.StatusOK || body["secret"] != tn.WebhookSecret {
+		t.Fatalf("got %d %v, want the tenant's secret", code, body)
+	}
+	if !strings.HasPrefix(tn.WebhookSecret, "whsec_") {
+		t.Fatalf("secret %q is not in Standard Webhooks format", tn.WebhookSecret)
+	}
+	if code, _ := e.do("GET", "/v1/webhook-secret", "", nil); code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated: %d, want 401", code)
+	}
+}

@@ -4,8 +4,13 @@ package worker_test
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -241,5 +246,50 @@ func TestWorker_ShutdownDrainsAllInFlightJobs(t *testing.T) {
 		if s := jobState(t, ctx, db, j); s != job.StateSucceeded {
 			t.Fatalf("job %s = %s after graceful shutdown, want succeeded", j.ID, s)
 		}
+	}
+}
+
+// A receiver holding the tenant's secret (as issued by create-tenant or
+// GET /v1/webhook-secret) can verify the request end to end.
+func TestWorker_SignsWithTenantSecret(t *testing.T) {
+	ctx := context.Background()
+	db := testutil.DB(t)
+	q := queue.New(testutil.Redis(t))
+	tn, _ := testutil.Tenant(t, db, 0, 100)
+
+	type delivery struct {
+		id, ts, sig string
+		body        []byte
+	}
+	got := make(chan delivery, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got <- delivery{r.Header.Get("webhook-id"), r.Header.Get("webhook-timestamp"), r.Header.Get("webhook-signature"), b}
+	}))
+	defer srv.Close()
+
+	w, cancel := startWorker(t, db, q)
+	defer func() { cancel(); w.Shutdown(5 * time.Second) }()
+
+	j := testutil.InsertJob(t, db, tn.ID, srv.URL, func(j *job.Job) {
+		j.Payload = []byte(`{"url":"` + srv.URL + `","body":{"hello":"world"}}`)
+	})
+	q.Enqueue(ctx, tn.ID, j.ID, j.Priority)
+
+	var d delivery
+	select {
+	case d = <-got:
+	case <-time.After(10 * time.Second):
+		t.Fatal("webhook never arrived")
+	}
+	key, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(tn.WebhookSecret, "whsec_"))
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(d.id + "." + d.ts + "."))
+	mac.Write(d.body)
+	if want := "v1," + base64.StdEncoding.EncodeToString(mac.Sum(nil)); d.sig != want {
+		t.Fatalf("signature %q does not verify with the tenant secret (want %q)", d.sig, want)
+	}
+	if d.id != j.ID.String() {
+		t.Fatalf("webhook-id = %q, want job ID %s", d.id, j.ID)
 	}
 }

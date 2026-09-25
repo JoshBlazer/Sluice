@@ -43,6 +43,8 @@ func TestTemplateBuild_Validation(t *testing.T) {
 		{"negative retries", Template{Type: "webhook", Payload: good, MaxRetries: ptr(-1)}, "max_retries"},
 		{"huge retries", Template{Type: "webhook", Payload: good, MaxRetries: ptr(1000)}, "max_retries"},
 		{"zero backoff", Template{Type: "webhook", Payload: good, BackoffSeconds: ptr(0)}, "backoff_seconds"},
+		{"negative timeout", Template{Type: "webhook", Payload: []byte(`{"url":"https://x","timeout_seconds":-1}`)}, "timeout_seconds"},
+		{"huge timeout", Template{Type: "webhook", Payload: []byte(`{"url":"https://x","timeout_seconds":901}`)}, "timeout_seconds"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

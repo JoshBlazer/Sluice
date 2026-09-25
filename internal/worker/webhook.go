@@ -3,22 +3,24 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/sluice/internal/job"
 )
 
-const (
-	httpTimeout      = 25 * time.Second
-	maxResponseDrain = 64 << 10
-)
+const maxResponseDrain = 64 << 10
 
 // Ranges that are not publicly routable but aren't covered by netip's
 // IsPrivate/IsLoopback/IsLinkLocal* helpers.
@@ -63,8 +65,8 @@ func newWebhookClient(allowPrivate bool) *http.Client {
 			return nil
 		}
 	}
+	// No client-wide timeout: each request gets its job's own timeout.
 	return &http.Client{
-		Timeout: httpTimeout,
 		Transport: &http.Transport{
 			// No proxy: a proxy would dial on our behalf and bypass the address check.
 			Proxy:                 nil,
@@ -88,7 +90,13 @@ func (w *Worker) executeWebhook(ctx context.Context, j *job.Job) error {
 	if method == "" {
 		method = http.MethodPost
 	}
+	secret, err := w.webhookSecret(ctx, j.TenantID)
+	if err != nil {
+		return err
+	}
 
+	ctx, cancel := context.WithTimeout(ctx, p.Timeout())
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, p.URL, bytes.NewReader(p.Body))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
@@ -98,6 +106,10 @@ func (w *Worker) executeWebhook(ctx context.Context, j *job.Job) error {
 	}
 	if req.Header.Get("Content-Type") == "" && len(p.Body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	// Signed last so a job's own headers can't replace the signature.
+	if err := signRequest(req.Header, secret, j.ID.String(), time.Now(), p.Body); err != nil {
+		return err
 	}
 
 	resp, err := w.http.Do(req)
@@ -110,5 +122,23 @@ func (w *Worker) executeWebhook(ctx context.Context, j *job.Job) error {
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("webhook returned %d", resp.StatusCode)
 	}
+	return nil
+}
+
+// signRequest adds Standard Webhooks (standardwebhooks.com) headers, so receivers
+// can verify requests with any of that spec's libraries. webhook-id is the job ID,
+// stable across retries, so receivers can also deduplicate at-least-once deliveries.
+func signRequest(h http.Header, secret, msgID string, at time.Time, body []byte) error {
+	key, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(secret, "whsec_"))
+	if err != nil {
+		return fmt.Errorf("decode webhook secret: %w", err)
+	}
+	ts := strconv.FormatInt(at.Unix(), 10)
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(msgID + "." + ts + "."))
+	mac.Write(body)
+	h.Set("webhook-id", msgID)
+	h.Set("webhook-timestamp", ts)
+	h.Set("webhook-signature", "v1,"+base64.StdEncoding.EncodeToString(mac.Sum(nil)))
 	return nil
 }

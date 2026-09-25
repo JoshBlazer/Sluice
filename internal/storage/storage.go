@@ -655,6 +655,50 @@ type Tenant struct {
 	RateLimit int
 	Weight    int
 	Status    string
+	// WebhookSecret signs this tenant's webhook requests ("whsec_" + base64).
+	WebhookSecret string
+}
+
+// NewWebhookSecret returns a fresh Standard Webhooks signing secret.
+func NewWebhookSecret() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate webhook secret: %w", err)
+	}
+	return "whsec_" + base64.StdEncoding.EncodeToString(b), nil
+}
+
+// RotateWebhookSecret replaces a tenant's webhook signing secret and returns it.
+// Workers pick it up on their next tenant refresh (within a minute, or on SIGHUP).
+func RotateWebhookSecret(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UUID) (string, error) {
+	secret, err := NewWebhookSecret()
+	if err != nil {
+		return "", err
+	}
+	tag, err := db.Exec(ctx, `UPDATE tenants SET webhook_secret = $1 WHERE id = $2`, secret, tenantID)
+	if err != nil {
+		return "", fmt.Errorf("rotate webhook secret: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return "", ErrNotFound
+	}
+	return secret, nil
+}
+
+// GetTenant fetches an active tenant by ID.
+func GetTenant(ctx context.Context, db *pgxpool.Pool, id uuid.UUID) (*Tenant, error) {
+	var t Tenant
+	err := db.QueryRow(ctx, `
+		SELECT id, name, rate_limit, weight, status, webhook_secret
+		FROM tenants WHERE id = $1 AND status = 'active'`, id).
+		Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get tenant %s: %w", id, err)
+	}
+	return &t, nil
 }
 
 // HashAPIKey returns the digest stored in tenants.api_key_hash for key.
@@ -675,9 +719,9 @@ func NewAPIKey() (string, error) {
 func GetTenantByAPIKey(ctx context.Context, db *pgxpool.Pool, apiKey string) (*Tenant, error) {
 	var t Tenant
 	err := db.QueryRow(ctx, `
-		SELECT id, name, rate_limit, weight, status
+		SELECT id, name, rate_limit, weight, status, webhook_secret
 		FROM tenants WHERE api_key_hash = $1 AND status = 'active'`, HashAPIKey(apiKey)).
-		Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status)
+		Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -694,11 +738,15 @@ func InsertTenant(ctx context.Context, db *pgxpool.Pool, name string, rateLimit,
 	if err != nil {
 		return nil, "", err
 	}
-	t := &Tenant{ID: uuid.New(), Name: name, RateLimit: rateLimit, Weight: weight, Status: "active"}
+	secret, err := NewWebhookSecret()
+	if err != nil {
+		return nil, "", err
+	}
+	t := &Tenant{ID: uuid.New(), Name: name, RateLimit: rateLimit, Weight: weight, Status: "active", WebhookSecret: secret}
 	_, err = db.Exec(ctx, `
-		INSERT INTO tenants (id, name, api_key_hash, rate_limit, weight, status)
-		VALUES ($1, $2, $3, $4, $5, $6)`,
-		t.ID, t.Name, HashAPIKey(key), t.RateLimit, t.Weight, t.Status)
+		INSERT INTO tenants (id, name, api_key_hash, rate_limit, weight, status, webhook_secret)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		t.ID, t.Name, HashAPIKey(key), t.RateLimit, t.Weight, t.Status, t.WebhookSecret)
 	if err != nil {
 		return nil, "", fmt.Errorf("insert tenant: %w", err)
 	}
@@ -839,7 +887,7 @@ func ListDeadLetter(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UUID, l
 // Used by workers to build the weighted-fair-queue dequeue set.
 func GetTenants(ctx context.Context, db *pgxpool.Pool) ([]*Tenant, error) {
 	rows, err := db.Query(ctx, `
-		SELECT id, name, rate_limit, weight, status
+		SELECT id, name, rate_limit, weight, status, webhook_secret
 		FROM tenants WHERE status = 'active'`)
 	if err != nil {
 		return nil, fmt.Errorf("get tenants: %w", err)
@@ -848,7 +896,7 @@ func GetTenants(ctx context.Context, db *pgxpool.Pool) ([]*Tenant, error) {
 	var out []*Tenant
 	for rows.Next() {
 		var t Tenant
-		if err := rows.Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret); err != nil {
 			return nil, fmt.Errorf("scan tenant: %w", err)
 		}
 		out = append(out, &t)

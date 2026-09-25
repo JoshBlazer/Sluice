@@ -109,6 +109,13 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, j)
 }
 
+// handleWebhookSecret returns the caller's webhook signing secret, which their
+// receivers need to verify Sluice's requests.
+func (s *Server) handleWebhookSecret(w http.ResponseWriter, r *http.Request) {
+	t, _ := tenant.FromContext(r.Context())
+	writeJSON(w, http.StatusOK, map[string]string{"secret": t.WebhookSecret, "scheme": "standard-webhooks-v1"})
+}
+
 // handleListJobRuns returns a job's attempt history, oldest first.
 func (s *Server) handleListJobRuns(w http.ResponseWriter, r *http.Request) {
 	t, _ := tenant.FromContext(r.Context())

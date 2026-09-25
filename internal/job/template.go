@@ -89,6 +89,9 @@ func validateWebhookPayload(raw json.RawMessage) error {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return errors.New("payload.url must be an absolute http or https URL")
 	}
+	if p.TimeoutSeconds < 0 || time.Duration(p.TimeoutSeconds)*time.Second > MaxWebhookTimeout {
+		return fmt.Errorf("payload.timeout_seconds must be between 1 and %d", int(MaxWebhookTimeout.Seconds()))
+	}
 	switch p.Method {
 	case "", http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
 	default:
