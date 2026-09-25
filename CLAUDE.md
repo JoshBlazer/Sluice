@@ -236,7 +236,8 @@ sluice/
 │   ├── kind/                # deps for the CI kind smoke test
 │   └── monitoring/          # Grafana dashboard, promtool alert tests
 ├── docs/                    # reference docs; README is the overview
-└── scripts/                 # loadtest/, bench/, chaos.sh, k8s-smoke.sh
+├── scripts/                 # loadtest/, bench/, demo/, chaos.sh, k8s-smoke.sh
+└── .devcontainer/           # Codespaces demo: setup.sh builds, start.sh runs the stack + demo traffic
 ```
 
 No `proto/`: gRPC was never needed.

@@ -1,0 +1,30 @@
+{
+  "name": "Sluice",
+  "image": "mcr.microsoft.com/devcontainers/go:1.27-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "24" },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "hostRequirements": { "cpus": 2, "memory": "8gb" },
+  // The dashboard proxies the API through its own origin, so the browser only
+  // needs the forwarded dashboard port. The demo key is the local-only dev tenant's.
+  "containerEnv": {
+    "SLUICE_API_PROXY": "http://localhost:8080",
+    "NEXT_PUBLIC_API_URL": "/sluice-api",
+    "NEXT_PUBLIC_DEMO_API_KEY": "dev-token"
+  },
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "postStartCommand": "bash .devcontainer/start.sh",
+  "forwardPorts": [3000, 8080, 16686, 9090],
+  "portsAttributes": {
+    "3000": { "label": "Dashboard", "onAutoForward": "openBrowser" },
+    "8080": { "label": "Sluice API", "onAutoForward": "silent" },
+    "16686": { "label": "Jaeger traces", "onAutoForward": "silent" },
+    "9090": { "label": "Prometheus", "onAutoForward": "silent" }
+  },
+  "otherPortsAttributes": { "onAutoForward": "silent" },
+  "customizations": {
+    "codespaces": { "openFiles": [".devcontainer/README.md"] },
+    "vscode": { "extensions": ["golang.go"] }
+  }
+}

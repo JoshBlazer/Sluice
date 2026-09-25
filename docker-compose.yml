@@ -74,6 +74,10 @@ services:
       - --web.console.templates=/usr/share/prometheus/consoles
     ports:
       - "9090:9090"
+    # Sluice runs on the host; Docker Desktop resolves host.docker.internal by
+    # itself, Linux (including Codespaces) needs this mapping.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./deploy/docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deploy/helm/files/alerts.yml:/etc/prometheus/alerts.yml:ro
