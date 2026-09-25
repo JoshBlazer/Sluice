@@ -141,7 +141,7 @@ func (w *Worker) loop(pollCtx context.Context) {
 		tenants := w.tenants
 		w.tenantsMu.RUnlock()
 
-		jobID, err := w.queue.Dequeue(pollCtx, w.id, tenants, dequeueTimeout)
+		item, err := w.queue.Pop(pollCtx, w.id, tenants, dequeueTimeout)
 		if err != nil {
 			if pollCtx.Err() != nil {
 				return
@@ -154,11 +154,17 @@ func (w *Worker) loop(pollCtx context.Context) {
 			}
 			continue
 		}
-		if jobID == uuid.Nil {
+		if item.JobID == uuid.Nil {
 			continue
 		}
 
-		w.process(w.execCtx, jobID)
+		if !w.process(w.execCtx, item) {
+			// Postgres is unavailable; back off rather than pop and requeue in a spin.
+			select {
+			case <-pollCtx.Done():
+			case <-time.After(time.Second):
+			}
+		}
 	}
 }
 
@@ -200,7 +206,10 @@ func (w *Worker) loadTenants(ctx context.Context) {
 	slog.Info("tenant weights loaded", "count", len(weights))
 }
 
-func (w *Worker) process(ctx context.Context, jobID uuid.UUID) {
+// process claims and executes one popped job. It returns false if the claim hit a
+// database error, after putting the job back on its queue.
+func (w *Worker) process(ctx context.Context, item queue.Item) bool {
+	jobID := item.JobID
 	tracer := telemetry.Tracer("sluice/worker")
 	ctx, span := tracer.Start(ctx, "worker.execute")
 	span.SetAttributes(attribute.String("job.id", jobID.String()))
@@ -216,10 +225,15 @@ func (w *Worker) process(ctx context.Context, jobID uuid.UUID) {
 	if err != nil {
 		telemetry.L(ctx).Error("claim failed", "job_id", jobID, "err", err)
 		span.RecordError(err)
-		return
+		// The job is out of Redis but still pending in Postgres. Put it back now
+		// rather than leave it for the reconciler, which only looks after a minute.
+		if err := w.queue.Requeue(context.WithoutCancel(ctx), item); err != nil {
+			telemetry.L(ctx).Error("requeue after failed claim", "job_id", jobID, "err", err)
+		}
+		return false
 	}
 	if j == nil {
-		return
+		return true
 	}
 
 	span.SetAttributes(
@@ -262,7 +276,9 @@ func (w *Worker) process(ctx context.Context, jobID uuid.UUID) {
 		metrics.JobsTotal.WithLabelValues(j.Type, finalState, tenantID).Inc()
 		metrics.JobDurationSeconds.WithLabelValues(j.Type, finalState, tenantID).Observe(dur.Seconds())
 
-		if err := storage.FailJob(recCtx, w.db, jobID, runID, token, execErr.Error(), nextRunAt); err != nil {
+		if err := retryRecord(recCtx, func(ctx context.Context) error {
+			return storage.FailJob(ctx, w.db, jobID, runID, token, execErr.Error(), nextRunAt)
+		}); err != nil {
 			telemetry.L(ctx).Error("record job failure", "job_id", jobID, "err", err)
 		}
 	} else {
@@ -270,8 +286,33 @@ func (w *Worker) process(ctx context.Context, jobID uuid.UUID) {
 		span.SetStatus(codes.Ok, "")
 		metrics.JobsTotal.WithLabelValues(j.Type, "succeeded", tenantID).Inc()
 		metrics.JobDurationSeconds.WithLabelValues(j.Type, "succeeded", tenantID).Observe(dur.Seconds())
-		if err := storage.CompleteJob(recCtx, w.db, jobID, runID, token); err != nil {
+		if err := retryRecord(recCtx, func(ctx context.Context) error {
+			return storage.CompleteJob(ctx, w.db, jobID, runID, token)
+		}); err != nil {
 			telemetry.L(ctx).Error("record job success", "job_id", jobID, "err", err)
+		}
+	}
+	return true
+}
+
+// retryRecord retries a job-outcome write with backoff until ctx expires. If the
+// outcome is never recorded, the job is reaped at its deadline and runs again, so
+// riding out a brief database outage here avoids a duplicate execution. Both
+// writes are idempotent: a stale claim token makes them no-ops.
+func retryRecord(ctx context.Context, write func(context.Context) error) error {
+	delay := 50 * time.Millisecond
+	for {
+		err := write(ctx)
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
+		if delay < 2*time.Second {
+			delay *= 2
 		}
 	}
 }

@@ -315,7 +315,7 @@ Every flag can also be set by environment variable:
 | `SLUICE_OTLP_ENDPOINT` | `--otlp-endpoint` | `localhost:4318` |
 | `SLUICE_PORT` | `--port` | `8080` (api) |
 | `SLUICE_METRICS_PORT` | `--metrics-port` | `9091` (scheduler), `9092` (worker) |
-| `SLUICE_WORKER_CONCURRENCY` | `--concurrency` | `10`. Jobs each worker process runs at once. Workers size their Postgres pool to match unless the URL sets `pool_max_conns` |
+| `SLUICE_WORKER_CONCURRENCY` | `--concurrency` | `10`. Jobs each worker process runs at once. Workers size their Postgres pool to `concurrency + 4` unless the URL sets `pool_max_conns`. Keep the total across all API, worker and scheduler processes under Postgres's `max_connections` (100 by default) |
 | `SLUICE_WEBHOOK_ALLOW_PRIVATE` | `--webhook-allow-private` | `false`. When false, webhooks to loopback, private, link-local (cloud metadata) and other non-public addresses are refused |
 | | `--shutdown-timeout` | `30s`. How long a stopping worker waits for its in-flight job before aborting it |
 
