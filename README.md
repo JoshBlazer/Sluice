@@ -186,13 +186,14 @@ Jobs are **webhooks**: an HTTP request (`GET`, `POST`, `PUT`, `PATCH` or `DELETE
 
 ## Performance Targets
 
-Design targets are for a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, Redis 7. Measurements so far come from CI and a single 4-core laptop running everything under Docker Desktop, a much smaller setup:
+Design targets are for a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, Redis 7. Measurements come from the [Benchmark workflow](.github/workflows/benchmark.yml), which runs Postgres, Redis, etcd and every Sluice role together on **one** 4-vCPU GitHub-hosted runner (a quarter of the target hardware), plus failover and recovery checks in CI:
 
-| Metric | Target | Measured |
+| Metric | Target (3 nodes) | Measured (1 shared 4-vCPU runner) |
 |--------|--------|----------|
-| Submission throughput | 10,000+ jobs/sec | Not yet benchmarked on target hardware |
-| Latency p50 (submit → execute) | < 10 ms | 14.5 ms on the laptop |
-| Latency p99 (submit → execute) | < 50 ms | ~95 ms on the laptop |
+| Submission throughput | 10,000+ jobs/sec | 2,550 jobs/sec; not yet run on target hardware |
+| Execution throughput | — | 1,686 jobs/sec (20,000 jobs in 11.9 s, 0 duplicate executions) |
+| Latency p50 (submit → execute) | < 10 ms | 0.65 ms |
+| Latency p99 (submit → execute) | < 50 ms | 2.9 ms |
 | Scheduler failover | < 2 seconds | ~50 ms on shutdown; 1.5–2.1 s after a crash (checked in CI) |
 | Worker crash recovery | — | < 20 seconds (checked in CI) |
 | Recovery from full node loss | < 30 seconds | Not yet measured |
