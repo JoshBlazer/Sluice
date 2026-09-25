@@ -1,0 +1,132 @@
+name: Benchmark
+
+# Runs the whole stack on one GitHub-hosted runner (4 vCPU / 16 GB for public
+# repos) and records scripts/loadtest results in the run summary. This is one
+# shared machine, not the README's 3-node target, so treat results as a floor.
+on:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: Jobs to submit in the throughput run
+        default: "20000"
+      submitters:
+        description: Concurrent submitters
+        default: "64"
+      workers:
+        description: Worker processes
+        default: "2"
+      concurrency:
+        description: Jobs per worker process
+        default: "20"
+  pull_request:
+    paths:
+      - .github/workflows/benchmark.yml
+      - scripts/loadtest/**
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    env:
+      N: ${{ inputs.jobs || '20000' }}
+      C: ${{ inputs.submitters || '64' }}
+      WORKERS: ${{ inputs.workers || '2' }}
+      CONCURRENCY: ${{ inputs.concurrency || '20' }}
+      DSN: postgres://sluice:sluice@localhost:5433/sluice?sslmode=disable
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sluice
+          POSTGRES_PASSWORD: sluice
+          POSTGRES_DB: sluice
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.16
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://localhost:2379
+        ports:
+          - 2379:2379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Build
+        run: |
+          go build -o bin/sluice ./cmd/sluice
+          go build -o bin/sluice-cli ./cmd/sluice-cli
+          go build -o bin/loadtest ./scripts/loadtest
+
+      - name: Migrate
+        run: |
+          go install -tags 'pgx5' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+          make migrate-up
+
+      - name: Start Sluice
+        run: |
+          mkdir -p logs
+          ./bin/sluice-cli create-tenant -rate-limit 0 bench | awk '/api key/{print $3}' > bench.key
+          SLUICE_POSTGRES_URL="$DSN&pool_max_conns=64" nohup ./bin/sluice --role api > logs/api.log 2>&1 &
+          SLUICE_POSTGRES_URL="$DSN" nohup ./bin/sluice --role scheduler > logs/scheduler.log 2>&1 &
+          for i in $(seq 1 "$WORKERS"); do
+            SLUICE_POSTGRES_URL="$DSN" SLUICE_WEBHOOK_ALLOW_PRIVATE=true \
+              nohup ./bin/sluice --role worker --concurrency "$CONCURRENCY" --metrics-port $((9200+i)) > logs/worker$i.log 2>&1 &
+          done
+          for i in $(seq 1 30); do curl -sf localhost:8080/healthz && break; sleep 1; done
+
+      - name: Throughput run
+        run: |
+          set +e
+          ./bin/loadtest -key "$(cat bench.key)" -n "$N" -c "$C" -wait 300s | tee throughput.txt
+          echo "exit=$?" >> throughput.txt
+
+      - name: Idle latency run
+        run: |
+          set +e
+          sleep 5
+          ./bin/loadtest -key "$(cat bench.key)" -listen 127.0.0.1:9098 -n 1000 -c 1 -wait 120s | tee latency.txt
+          echo "exit=$?" >> latency.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Sluice benchmark"
+            echo
+            echo "Single GitHub-hosted runner: $(nproc) vCPU, $(free -g | awk '/Mem:/{print $2}') GB RAM, $(lscpu | awk -F: '/Model name/{gsub(/^ +/,"",$2); print $2}')."
+            echo "Postgres, Redis, etcd and all Sluice roles share this one machine."
+            echo
+            echo "Config: $N jobs, $C submitters, $WORKERS worker processes × $CONCURRENCY concurrency."
+            echo
+            echo "### Throughput run"
+            echo '```'; cat throughput.txt 2>/dev/null; echo '```'
+            echo "### Idle latency run (1 submitter)"
+            echo '```'; cat latency.txt 2>/dev/null; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-logs
+          path: |
+            logs/
+            throughput.txt
+            latency.txt
