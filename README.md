@@ -92,6 +92,7 @@ Traces for these requests are in Jaeger at http://localhost:16686, and metrics i
 | [Deployment](docs/deployment.md) | Releases, the Docker image, the Helm chart, recommended production layout |
 | [Operations](docs/operations.md) | Tenants, the admin CLI and admin API, observability, the dashboard |
 | [Testing](docs/testing.md) | Unit, integration and chaos tests, load testing |
+| [Benchmarking](docs/benchmarking.md) | Measuring the performance targets on real multi-machine hardware |
 | [Architecture](architecture.md) | Design and trade-offs |
 | [API reference](internal/api/openapi.yaml) | OpenAPI 3.1, also served by the API at `/openapi.yaml` |
 
@@ -146,7 +147,7 @@ Design targets are for a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, R
 | Worker crash recovery | — | < 20 seconds (checked in CI) |
 | Recovery from full node loss | < 30 seconds | ~12 s: every Sluice process killed with 3,000 jobs in flight, none lost ([chaos tests](docs/testing.md#failure-mode-chaos-tests)) |
 
-Throughput is given as a range because GitHub assigns runners with different CPU models, and the same code measures up to 2x apart between them. To reproduce these numbers against your own stack, see [Load testing](docs/testing.md#load-testing).
+Throughput is given as a range because GitHub assigns runners with different CPU models, and the same code measures up to 2x apart between them. To reproduce these numbers against your own stack, see [Load testing](docs/testing.md#load-testing); to measure the 3-node targets on real machines, see [Benchmarking](docs/benchmarking.md).
 
 ---
 

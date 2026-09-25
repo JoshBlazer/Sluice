@@ -41,3 +41,6 @@ redis-data/
 # Screenshots / scratch (root-level only — keeps web/ assets safe)
 /*.png
 .playwright-mcp/
+bench-results/
+bench-local/
+scripts/bench/hosts.txt

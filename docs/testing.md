@@ -43,4 +43,4 @@ go run ./scripts/loadtest -key <key> -n 20000 -c 64
 
 It reports submission throughput, submit latency, submit→execute latency percentiles and duplicate deliveries. Execution throughput scales with worker replicas × `--concurrency`. Under heavy submission load, give the API more database connections (see [Configuration](configuration.md#database-connections)).
 
-The [Benchmark workflow](../.github/workflows/benchmark.yml) runs this against a full stack on a GitHub runner; results are summarised in the [README](../README.md#performance).
+The [Benchmark workflow](../.github/workflows/benchmark.yml) runs this against a full stack on a GitHub runner; results are summarised in the [README](../README.md#performance). To measure the 3-node targets on separate machines, see [Benchmarking](benchmarking.md).

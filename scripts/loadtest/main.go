@@ -24,13 +24,14 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 func main() {
-	api := flag.String("api", "http://localhost:8080", "Sluice API base URL")
+	apiFlag := flag.String("api", "http://localhost:8080", "Sluice API base URL; comma-separate several to spread submissions across them")
 	key := flag.String("key", os.Getenv("SLUICE_API_KEY"), "tenant API key")
 	n := flag.Int("n", 10000, "jobs to submit")
 	c := flag.Int("c", 32, "concurrent submitters")
@@ -46,6 +47,7 @@ func main() {
 	if *callback == "" {
 		*callback = "http://" + *listen + "/hook"
 	}
+	apis := strings.Split(*apiFlag, ",")
 
 	var (
 		mu       sync.Mutex
@@ -105,7 +107,7 @@ func main() {
 					"type":    "webhook",
 					"payload": map[string]any{"url": fmt.Sprintf("%s?seq=%d", *callback, seq)},
 				})
-				req, _ := http.NewRequest("POST", *api+"/v1/jobs", bytes.NewReader(body))
+				req, _ := http.NewRequest("POST", apis[seq%len(apis)]+"/v1/jobs", bytes.NewReader(body))
 				req.Header.Set("Authorization", "Bearer "+*key)
 				req.Header.Set("Content-Type", "application/json")
 
@@ -150,7 +152,7 @@ func main() {
 	mu.Unlock()
 
 	fmt.Printf("jobs submitted:        %d ok, %d failed\n", ok, failures.Load())
-	fmt.Printf("submission throughput: %.0f jobs/sec (%d submitters)\n", float64(ok)/submitElapsed.Seconds(), *c)
+	fmt.Printf("submission throughput: %.0f jobs/sec (%d submitters, %d APIs)\n", float64(ok)/submitElapsed.Seconds(), *c, len(apis))
 	fmt.Printf("submit latency:        p50 %v  p99 %v\n", pct(subs, 50), pct(subs, 99))
 	fmt.Printf("jobs executed:         %d/%d in %v\n", received.Load(), ok, totalElapsed.Round(time.Millisecond))
 	fmt.Printf("execution throughput:  %.0f jobs/sec\n", float64(received.Load())/totalElapsed.Seconds())
