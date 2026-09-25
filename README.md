@@ -14,7 +14,7 @@ Sluice is a from-scratch alternative to Sidekiq, Celery, or AWS SQS + EventBridg
 
 Most teams reach for either a Redis-only queue (fast but loses jobs on crash) or a full workflow engine like Temporal (powerful but heavy). Sluice occupies the middle: Postgres as the durable source of truth, Redis as the hot path, and a clean separation between scheduling and execution.
 
-- **Redis is just a cache** — the API answers only after the job is committed to Postgres. Flush or lose Redis entirely and the scheduler rebuilds the queues from Postgres within about 90 seconds; no job is lost
+- **Redis is just a cache** — the API answers only after the job is committed to Postgres. Flush or lose Redis entirely and the scheduler rebuilds the queues from Postgres; in the chaos tests, 3,000 in-flight jobs all ran within 40 seconds of Redis losing its data
 - **Durable by default** — jobs survive crashes, network partitions, and worker death. A crashed worker's job is picked up again within 20 seconds
 - **At-least-once delivery, without double-writes** — a stalled worker that wakes up after its job was reassigned can't overwrite the new result, and idempotency keys deduplicate submissions
 - **Scheduler HA** — leader election via etcd with hot standbys. Failover takes ~50ms on shutdown and ~2s (up to ~2.6s) after a crash, and two leaders overlapping briefly can't double-run anything
@@ -220,7 +220,7 @@ Design targets are for a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, R
 | Latency p99 (submit → execute) | < 50 ms | 2.9 ms |
 | Scheduler failover | < 2 seconds | ~50 ms on shutdown; 1.5–2.6 s after a crash, bounded by etcd lease expiry (checked in CI) |
 | Worker crash recovery | — | < 20 seconds (checked in CI) |
-| Recovery from full node loss | < 30 seconds | Not yet measured |
+| Recovery from full node loss | < 30 seconds | 17 s: every Sluice process killed with 3,000 jobs in flight, none lost ([chaos tests](#failure-mode-tests)) |
 
 `scripts/loadtest` reproduces the throughput and latency measurements against any running stack; see [Load testing](#load-testing).
 
@@ -368,6 +368,21 @@ Two tiers:
 2. **Integration tests** (`-tags integration`) — run the API, worker, scheduler loops, queue and storage against real Postgres and Redis: retries into dead letter, crashed-worker recovery, graceful drain, tenant isolation, rate limits, cron dedup. They use Redis DB 15 and throwaway tenants, so they don't disturb local dev data, and skip if the stack isn't up. `make up && make migrate-up && make test-integration`
 
 CI runs both with `-race` on every push and pull request, and there a missing stack is a failure rather than a skip (`SLUICE_TEST_REQUIRE_INFRA=1`). CI also builds the Docker image, lints and renders the Helm chart, builds the dashboard, and fails on known vulnerabilities (`govulncheck` for Go, `npm audit` for the dashboard's production dependencies). Dependabot proposes dependency updates weekly.
+
+### Failure-mode tests
+
+The [Chaos workflow](.github/workflows/chaos.yml) ([`scripts/chaos.sh`](scripts/chaos.sh)) runs weekly and on PRs touching the job pipeline. It injects a fault while 3,000 jobs are in flight and checks that every accepted job still executes. Latest results on a GitHub runner:
+
+| Fault | Accepted jobs executed | Duplicate executions | Drained after the fault |
+|---|---|---|---|
+| Worker `kill -9` | 3,000 / 3,000 | 0 | 19 s |
+| Scheduler leader `kill -9` | 3,000 / 3,000 | 0 | 14 s |
+| Redis loses all data (`FLUSHALL`) | 3,000 / 3,000 | 0 | 38 s |
+| Redis restart | 3,000 / 3,000 | 0 | 12 s |
+| Postgres restart | 3,000 / 3,000 | 0 | 13 s |
+| Every Sluice process `kill -9`, then restarted | 3,000 / 3,000 | 24 | 17 s |
+
+Duplicates are at-least-once re-runs of jobs whose worker died mid-request. Receivers deduplicate them by the `webhook-id` header.
 
 ### Load testing
 
