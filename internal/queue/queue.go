@@ -19,7 +19,13 @@ const (
 	heartbeatPrefix  = "heartbeat:"
 	// enqueued:{job_id} marks a job as waiting in some queue list.
 	enqueuedPrefix = "enqueued:"
+	// worker-alive:{worker_id} exists while a worker is running.
+	workerAlivePrefix = "worker-alive:"
 )
+
+// WorkerAliveTTL is how long a worker counts as alive after its last MarkAlive.
+// Workers refresh every WorkerAliveTTL/3.
+const WorkerAliveTTL = 15 * time.Second
 
 // EnqueuedPattern matches every job's "already queued" marker, for tools that
 // flush the queues and must clear markers along with them.
@@ -182,6 +188,58 @@ func (q *Queue) Pop(ctx context.Context, workerID string, tenants []TenantWeight
 		slog.Warn("record processing list", "worker_id", workerID, "job_id", id, "err", err)
 	}
 	return Item{JobID: id, List: list}, nil
+}
+
+// MarkAlive records that workerID is running. A worker that stops refreshing
+// this is treated as dead, and the jobs it had popped are recovered.
+func (q *Queue) MarkAlive(ctx context.Context, workerID string) error {
+	if err := q.rdb.Set(ctx, workerAlivePrefix+workerID, 1, WorkerAliveTTL).Err(); err != nil {
+		return fmt.Errorf("mark worker alive: %w", err)
+	}
+	return nil
+}
+
+// DeadWorkerJobs finds processing lists whose worker is no longer alive and
+// returns the job IDs in them, removing the lists. These are jobs a worker
+// popped and may not have claimed before it died: without this they'd sit
+// pending in Postgres, out of Redis, until the pending reconciler found them.
+func (q *Queue) DeadWorkerJobs(ctx context.Context) ([]uuid.UUID, error) {
+	var out []uuid.UUID
+	var cursor uint64
+	for {
+		keys, next, err := q.rdb.Scan(ctx, cursor, processingPrefix+"*", 200).Result()
+		if err != nil {
+			return out, fmt.Errorf("scan processing lists: %w", err)
+		}
+		for _, key := range keys {
+			worker := strings.TrimPrefix(key, processingPrefix)
+			alive, err := q.rdb.Exists(ctx, workerAlivePrefix+worker).Result()
+			if err != nil {
+				return out, fmt.Errorf("check worker %s: %w", worker, err)
+			}
+			if alive == 1 {
+				continue
+			}
+			// LRANGE then DEL in one transaction, so a list is recovered exactly once.
+			var ids *redis.StringSliceCmd
+			if _, err := q.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+				ids = p.LRange(ctx, key, 0, -1)
+				p.Del(ctx, key)
+				return nil
+			}); err != nil {
+				return out, fmt.Errorf("take processing list %s: %w", key, err)
+			}
+			for _, v := range ids.Val() {
+				if id, err := uuid.Parse(v); err == nil {
+					out = append(out, id)
+				}
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return out, nil
+		}
+	}
 }
 
 // Depth is the number of jobs waiting in one tenant's priority lane.

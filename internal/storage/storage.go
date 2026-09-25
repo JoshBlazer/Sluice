@@ -475,23 +475,38 @@ func GetJobForTenant(ctx context.Context, db *pgxpool.Pool, id uuid.UUID, tenant
 	return j, nil
 }
 
-// GetPendingJobs returns pending jobs whose run_at is due, for the reconciliation loop.
-// Re-enqueueing these is idempotent: TryClaim's SKIP LOCKED guards against double execution.
-func GetPendingJobs(ctx context.Context, db *pgxpool.Pool, limit int) ([]*job.Job, error) {
+// PendingCursor marks where a GetPendingJobs page ended; the zero value starts
+// from the beginning.
+type PendingCursor struct {
+	Priority  int16
+	CreatedAt time.Time
+	ID        uuid.UUID
+}
+
+// GetPendingJobs returns up to limit pending jobs that became due more than
+// olderThan ago, after the cursor, for the reconciliation loop. Paging (on the
+// idx_jobs_pending order) lets a pass cover every stranded job rather than the
+// same oldest few. Re-enqueueing is idempotent, so returning jobs that are in
+// fact still queued is harmless.
+func GetPendingJobs(ctx context.Context, db *pgxpool.Pool, olderThan time.Duration, after PendingCursor, limit int) ([]*job.Job, PendingCursor, error) {
 	rows, err := db.Query(ctx, `
-		SELECT id, tenant_id, type, payload, priority, state,
-		       run_at, claimed_at, claimed_by, claim_token, deadline,
-		       attempt, max_retries, backoff_seconds, idempotency_key,
-		       last_error, created_at, completed_at
+		SELECT `+jobColumns+`
 		FROM jobs
-		WHERE state = 'pending' AND run_at <= NOW() - INTERVAL '1 minute'
-		ORDER BY priority, run_at
-		LIMIT $1`, limit)
+		WHERE state = 'pending' AND run_at <= $1
+		  AND (priority, created_at, id) > ($2, $3, $4)
+		ORDER BY priority, created_at, id
+		LIMIT $5`,
+		time.Now().Add(-olderThan), after.Priority, after.CreatedAt, after.ID, limit)
 	if err != nil {
-		return nil, fmt.Errorf("get pending jobs: %w", err)
+		return nil, after, fmt.Errorf("get pending jobs: %w", err)
 	}
 	defer rows.Close()
-	return collectJobs(rows)
+	jobs, err := collectJobs(rows)
+	if err != nil || len(jobs) == 0 {
+		return jobs, after, err
+	}
+	last := jobs[len(jobs)-1]
+	return jobs, PendingCursor{Priority: last.Priority, CreatedAt: last.CreatedAt, ID: last.ID}, nil
 }
 
 // PromoteScheduledToPending moves a scheduled job to pending when its run_at has arrived.

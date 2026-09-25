@@ -252,3 +252,37 @@ func TestReconcilePending_RebuildsQueuesAfterRedisLoss(t *testing.T) {
 		}
 	}
 }
+
+// A worker that pops a job and dies before claiming it leaves the job pending in
+// Postgres but gone from Redis. The scheduler must put it back promptly, and
+// leave live workers' jobs alone.
+func TestRecoverDeadWorkerJobs(t *testing.T) {
+	ctx := context.Background()
+	db := testutil.DB(t)
+	q := queue.New(testutil.Redis(t))
+	tn, _ := testutil.Tenant(t, db, 0, 100)
+	s := New(db, q)
+	tenants := []queue.TenantWeight{{ID: tn.ID, Weight: 1}}
+
+	dead := testutil.InsertJob(t, db, tn.ID, "https://example.com", nil)
+	live := testutil.InsertJob(t, db, tn.ID, "https://example.com", nil)
+	q.Enqueue(ctx, tn.ID, dead.ID, dead.Priority)
+	if got, _ := q.Dequeue(ctx, "ghost", tenants, time.Second); got != dead.ID {
+		t.Fatalf("ghost popped %s, want %s", got, dead.ID)
+	}
+	q.MarkAlive(ctx, "busy")
+	q.Enqueue(ctx, tn.ID, live.ID, live.Priority)
+	if got, _ := q.Dequeue(ctx, "busy", tenants, time.Second); got != live.ID {
+		t.Fatalf("busy popped %s, want %s", got, live.ID)
+	}
+
+	s.recoverDeadWorkerJobs(ctx)
+
+	got, err := q.Dequeue(ctx, "w2", tenants, time.Second)
+	if err != nil || got != dead.ID {
+		t.Fatalf("after recovery popped %s (%v), want the dead worker's job %s", got, err, dead.ID)
+	}
+	if again, _ := q.Dequeue(ctx, "w2", tenants, 300*time.Millisecond); again != uuid.Nil {
+		t.Fatalf("live worker's job %s was re-enqueued too", again)
+	}
+}

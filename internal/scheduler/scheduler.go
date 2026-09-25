@@ -20,21 +20,28 @@ import (
 )
 
 const (
-	duePollInterval           = 100 * time.Millisecond
-	staleReapInterval         = 5 * time.Second
-	deadLetterInterval        = 30 * time.Second
-	cronInterval              = 60 * time.Second
-	pendingReconcileInterval  = 30 * time.Second
-	partitionMaintainInterval = 24 * time.Hour
-	duePollBatchSize          = 500
-	failedPollBatchSize       = 500
-	cronBatchSize             = 200
-	pendingReconcileBatchSize = 500
-	partitionLookaheadMonths  = 3
-	deadLetterBatchSize       = 500
-	queueDepthInterval        = 5 * time.Second
-	retentionInterval         = time.Hour
-	retentionBatchSize        = 1000
+	duePollInterval          = 100 * time.Millisecond
+	staleReapInterval        = 5 * time.Second
+	deadLetterInterval       = 30 * time.Second
+	cronInterval             = 60 * time.Second
+	pendingReconcileInterval = 15 * time.Second
+	// A pending job is only re-enqueued once it has been due this long, so the
+	// API's own insert-then-enqueue isn't raced.
+	pendingReconcileAge = 30 * time.Second
+	// Cap per pass, so a huge backlog of genuinely queued jobs (for which
+	// re-enqueueing is a no-op) doesn't turn into a flood of Redis calls.
+	pendingReconcileMaxPerPass = 5000
+	deadWorkerInterval         = 5 * time.Second
+	partitionMaintainInterval  = 24 * time.Hour
+	duePollBatchSize           = 500
+	failedPollBatchSize        = 500
+	cronBatchSize              = 200
+	pendingReconcileBatchSize  = 500
+	partitionLookaheadMonths   = 3
+	deadLetterBatchSize        = 500
+	queueDepthInterval         = 5 * time.Second
+	retentionInterval          = time.Hour
+	retentionBatchSize         = 1000
 )
 
 var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
@@ -83,6 +90,7 @@ func (s *Scheduler) lead(ctx context.Context) {
 		s.runDeadLetterPromoter,
 		s.runCronExpander,
 		s.runPendingReconciler,
+		s.runDeadWorkerRecovery,
 		s.runPartitionMaintainer,
 		s.runQueueDepthExporter,
 		s.runRetention,
@@ -312,19 +320,69 @@ func (s *Scheduler) runPendingReconciler(ctx context.Context) {
 	}
 }
 
+// reconcilePending re-enqueues pending jobs that have been due a while, in case
+// Redis lost them (flush, failover, drain). Enqueue is idempotent, so jobs that
+// are in fact still queued are untouched.
 func (s *Scheduler) reconcilePending(ctx context.Context) {
-	jobs, err := storage.GetPendingJobs(ctx, s.db, pendingReconcileBatchSize)
-	if err != nil {
-		slog.Error("reconcile pending jobs", "err", err)
-		return
+	var cursor storage.PendingCursor
+	checked := 0
+	for checked < pendingReconcileMaxPerPass && ctx.Err() == nil {
+		jobs, next, err := storage.GetPendingJobs(ctx, s.db, pendingReconcileAge, cursor, pendingReconcileBatchSize)
+		if err != nil {
+			slog.Error("reconcile pending jobs", "err", err)
+			return
+		}
+		for _, j := range jobs {
+			if err := s.queue.Enqueue(ctx, j.TenantID, j.ID, j.Priority); err != nil {
+				slog.Error("re-enqueue pending job", "job_id", j.ID, "err", err)
+			}
+		}
+		checked += len(jobs)
+		if len(jobs) < pendingReconcileBatchSize {
+			break
+		}
+		cursor = next
 	}
-	for _, j := range jobs {
-		if err := s.queue.Enqueue(ctx, j.TenantID, j.ID, j.Priority); err != nil {
-			slog.Error("re-enqueue pending job", "job_id", j.ID, "err", err)
+	if checked > 0 {
+		slog.Debug("reconciled pending jobs", "checked", checked)
+	}
+}
+
+func (s *Scheduler) runDeadWorkerRecovery(ctx context.Context) {
+	ticker := time.NewTicker(deadWorkerInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.recoverDeadWorkerJobs(ctx)
 		}
 	}
-	if len(jobs) > 0 {
-		slog.Info("reconciled pending jobs", "count", len(jobs))
+}
+
+// recoverDeadWorkerJobs re-enqueues jobs a dead worker popped but never claimed.
+// Jobs it did claim are running in Postgres and come back via the stale-claim
+// reaper instead.
+func (s *Scheduler) recoverDeadWorkerJobs(ctx context.Context) {
+	ids, err := s.queue.DeadWorkerJobs(ctx)
+	if err != nil {
+		slog.Error("find dead workers' jobs", "err", err)
+	}
+	recovered := 0
+	for _, id := range ids {
+		j, err := storage.GetJob(ctx, s.db, id)
+		if err != nil || j.State != job.StatePending {
+			continue
+		}
+		if err := s.queue.Enqueue(ctx, j.TenantID, j.ID, j.Priority); err != nil {
+			slog.Error("re-enqueue dead worker's job", "job_id", id, "err", err)
+			continue
+		}
+		recovered++
+	}
+	if recovered > 0 {
+		slog.Warn("recovered jobs from dead workers", "count", recovered)
 	}
 }
 

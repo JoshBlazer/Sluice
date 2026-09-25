@@ -329,8 +329,8 @@ func TestWorker_EnforcesTenantConcurrencyLimit(t *testing.T) {
 	q := queue.New(testutil.Redis(t))
 	capped, _ := testutil.Tenant(t, db, 0, 100)
 	free, _ := testutil.Tenant(t, db, 0, 100)
-	two := 2
-	if _, err := storage.UpdateTenantLimits(ctx, db, capped.ID, storage.TenantLimits{MaxConcurrency: &two}); err != nil {
+	one := 1
+	if _, err := storage.UpdateTenantLimits(ctx, db, capped.ID, storage.TenantLimits{MaxConcurrency: &one}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -362,7 +362,7 @@ func TestWorker_EnforcesTenantConcurrencyLimit(t *testing.T) {
 		q.Enqueue(ctx, capped.ID, j.ID, j.Priority)
 		all = append(all, j)
 	}
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 6; i++ {
 		j := testutil.InsertJob(t, db, free.ID, freeSrv.URL, nil)
 		q.Enqueue(ctx, free.ID, j.ID, j.Priority)
 		all = append(all, j)
@@ -376,10 +376,11 @@ func TestWorker_EnforcesTenantConcurrencyLimit(t *testing.T) {
 		}
 		return true
 	})
-	if p := cappedC.peak.Load(); p > 2 {
-		t.Fatalf("capped tenant peaked at %d concurrent jobs, limit is 2", p)
+	if p := cappedC.peak.Load(); p > 1 {
+		t.Fatalf("capped tenant peaked at %d concurrent jobs, limit is 1", p)
 	}
-	if p := freeC.peak.Load(); p < 3 {
-		t.Fatalf("uncapped tenant peaked at only %d concurrent jobs; the cap shouldn't hold it back", p)
+	// The cap is per tenant: the uncapped tenant must be able to exceed it.
+	if p := freeC.peak.Load(); p < 2 {
+		t.Fatalf("uncapped tenant peaked at %d concurrent jobs; another tenant's cap held it back", p)
 	}
 }
