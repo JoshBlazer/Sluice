@@ -30,6 +30,12 @@ var (
 		Buckets: []float64{.01, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60},
 	}, []string{"type", "state", "tenant_id"})
 
+	// Claims skipped because a tenant was at its max_concurrency.
+	TenantThrottledTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sluice_tenant_throttled_total",
+		Help: "Jobs put back because their tenant was at its concurrency limit.",
+	}, []string{"tenant_id"})
+
 	// Worker in-flight gauge.
 	WorkerInFlight = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "sluice_worker_jobs_in_flight",

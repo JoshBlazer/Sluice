@@ -63,6 +63,8 @@ func main() {
 		cmdRotateWebhookSecret(ctx, db, flag.Args()[1:])
 	case "enable-dev-tenant":
 		cmdEnableDevTenant(ctx, db)
+	case "set-tenant-limits":
+		cmdSetTenantLimits(ctx, db, flag.Args()[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", flag.Arg(0))
 		usage()
@@ -207,15 +209,19 @@ func cmdCreateTenant(ctx context.Context, db *pgxpool.Pool, args []string) {
 	fs := flag.NewFlagSet("create-tenant", flag.ExitOnError)
 	rateLimit := fs.Int("rate-limit", 100, "max job submissions per second (0 = unlimited)")
 	weight := fs.Int("weight", 100, "fair-queuing weight relative to other tenants")
+	maxConcurrency := fs.Int("max-concurrency", 0, "max jobs running at once (0 = unlimited)")
 	fs.Parse(args) //nolint:errcheck // ExitOnError exits instead of returning
 	if fs.NArg() != 1 {
-		fatalf("usage: sluice-cli create-tenant [-rate-limit N] [-weight N] <name>")
+		fatalf("usage: sluice-cli create-tenant [-rate-limit N] [-weight N] [-max-concurrency N] <name>")
 	}
 	if *weight <= 0 {
 		fatalf("weight must be positive")
 	}
+	if *maxConcurrency < 0 {
+		fatalf("max-concurrency must be 0 (unlimited) or positive")
+	}
 
-	t, key, err := storage.InsertTenant(ctx, db, fs.Arg(0), *rateLimit, *weight)
+	t, key, err := storage.InsertTenant(ctx, db, fs.Arg(0), *rateLimit, *weight, *maxConcurrency)
 	if err != nil {
 		fatalf("create tenant: %v", err)
 	}
@@ -223,6 +229,42 @@ func cmdCreateTenant(ctx context.Context, db *pgxpool.Pool, args []string) {
 		"Store the API key now — only its hash is kept. The webhook secret verifies Sluice's\n"+
 		"requests to your endpoints; it can be fetched later from GET /v1/webhook-secret.\n",
 		t.ID, key, t.WebhookSecret)
+}
+
+func cmdSetTenantLimits(ctx context.Context, db *pgxpool.Pool, args []string) {
+	fs := flag.NewFlagSet("set-tenant-limits", flag.ExitOnError)
+	rateLimit := fs.Int("rate-limit", -1, "max job submissions per second (0 = unlimited)")
+	weight := fs.Int("weight", -1, "fair-queuing weight relative to other tenants")
+	maxConcurrency := fs.Int("max-concurrency", -1, "max jobs running at once (0 = unlimited)")
+	fs.Parse(args) //nolint:errcheck // ExitOnError exits instead of returning
+	if fs.NArg() != 1 {
+		fatalf("usage: sluice-cli set-tenant-limits [-rate-limit N] [-weight N] [-max-concurrency N] <tenant-id>")
+	}
+	tenantID, err := uuid.Parse(fs.Arg(0))
+	if err != nil {
+		fatalf("invalid tenant id: %v", err)
+	}
+
+	var l storage.TenantLimits
+	set := func(v *int) *int {
+		if *v < 0 {
+			return nil
+		}
+		return v
+	}
+	l.RateLimit, l.Weight, l.MaxConcurrency = set(rateLimit), set(weight), set(maxConcurrency)
+	if l.RateLimit == nil && l.Weight == nil && l.MaxConcurrency == nil {
+		fatalf("nothing to change: pass -rate-limit, -weight and/or -max-concurrency")
+	}
+	if l.Weight != nil && *l.Weight == 0 {
+		fatalf("weight must be positive")
+	}
+	t, err := storage.UpdateTenantLimits(ctx, db, tenantID, l)
+	if err != nil {
+		fatalf("set tenant limits: %v", err)
+	}
+	fmt.Printf("%s: rate-limit %d/s, weight %d, max-concurrency %d (0 = unlimited)\n",
+		t.Name, t.RateLimit, t.Weight, t.MaxConcurrency)
 }
 
 // cmdEnableDevTenant re-enables the seeded local-development tenant, whose API
@@ -450,6 +492,8 @@ Commands:
   rotate-key <id>     issue a new API key for a tenant, revoking the old one
   rotate-webhook-secret <id>
                       issue a new webhook signing secret for a tenant
+  set-tenant-limits <id>
+                      change a tenant's -rate-limit, -weight or -max-concurrency
   enable-dev-tenant   LOCAL DEVELOPMENT ONLY: enable the "dev" tenant whose
                       API key is the public string "dev-token"
 

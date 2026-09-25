@@ -75,7 +75,7 @@ func Redis(t testing.TB) *redis.Client {
 func Tenant(t testing.TB, db *pgxpool.Pool, rateLimit, weight int) (*storage.Tenant, string) {
 	t.Helper()
 	ctx := context.Background()
-	tn, key, err := storage.InsertTenant(ctx, db, "test-"+t.Name(), rateLimit, weight)
+	tn, key, err := storage.InsertTenant(ctx, db, "test-"+t.Name(), rateLimit, weight, 0)
 	if err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}

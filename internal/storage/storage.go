@@ -107,14 +107,10 @@ const jobColumns = `id, tenant_id, type, payload, priority, state,
 	attempt, max_retries, backoff_seconds, idempotency_key,
 	last_error, created_at, completed_at`
 
-// TryClaim atomically claims a pending job for a worker and opens its job_runs row,
-// in one statement. The row is locked with SELECT ... FOR UPDATE SKIP LOCKED, so
-// concurrent claimers never both win. Returns (nil, uuid.Nil, nil) if the job is
-// not pending (already claimed, cancelled, or finished). On success it returns the
-// job as claimed and the run ID that later updates must be scoped to.
-func TryClaim(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID, workerID string, token uuid.UUID, deadline time.Time) (*job.Job, uuid.UUID, error) {
-	runID := uuid.New()
-	row := db.QueryRow(ctx, `
+// claimSQL claims a pending job and opens its job_runs row in one statement. The
+// row is locked with SELECT ... FOR UPDATE SKIP LOCKED, so concurrent claimers
+// never both win.
+const claimSQL = `
 		WITH claimed AS (
 			UPDATE jobs SET
 				state       = 'running',
@@ -126,14 +122,61 @@ func TryClaim(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID, workerID s
 				SELECT id FROM jobs
 				WHERE id = $1 AND state = 'pending'
 				FOR UPDATE SKIP LOCKED)
-			RETURNING `+jobColumns+`
+			RETURNING ` + jobColumns + `
 		), run AS (
 			INSERT INTO job_runs (id, job_id, tenant_id, attempt, started_at, state)
 			SELECT $6, id, tenant_id, attempt, $2, 'running' FROM claimed
 		)
-		SELECT `+jobColumns+` FROM claimed`,
-		jobID, time.Now(), workerID, token, deadline, runID)
-	j, err := scanJob(row)
+		SELECT ` + jobColumns + ` FROM claimed`
+
+// ErrConcurrencyLimit means the job's tenant already has max_concurrency jobs running.
+var ErrConcurrencyLimit = errors.New("tenant concurrency limit reached")
+
+// TryClaim atomically claims a pending job for a worker. Returns (nil, uuid.Nil, nil)
+// if the job is not pending (already claimed, cancelled, or finished). On success
+// it returns the job as claimed and the run ID later updates must be scoped to.
+func TryClaim(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID, workerID string, token uuid.UUID, deadline time.Time) (*job.Job, uuid.UUID, error) {
+	return claim(ctx, db, jobID, workerID, token, deadline)
+}
+
+// TryClaimLimited is TryClaim for a tenant with a concurrency cap. It serializes
+// claims for that tenant on its tenants row, then counts running jobs in a fresh
+// statement (so the count sees claims committed while it waited), and returns
+// ErrConcurrencyLimit instead of claiming when the tenant is at its limit.
+func TryClaimLimited(ctx context.Context, db *pgxpool.Pool, jobID, tenantID uuid.UUID, limit int, workerID string, token uuid.UUID, deadline time.Time) (*job.Job, uuid.UUID, error) {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return nil, uuid.Nil, fmt.Errorf("begin claim: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE`, tenantID); err != nil {
+		return nil, uuid.Nil, fmt.Errorf("lock tenant %s: %w", tenantID, err)
+	}
+	var running int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FROM jobs WHERE tenant_id = $1 AND state IN ('claimed', 'running')`,
+		tenantID).Scan(&running); err != nil {
+		return nil, uuid.Nil, fmt.Errorf("count running jobs: %w", err)
+	}
+	if running >= limit {
+		return nil, uuid.Nil, ErrConcurrencyLimit
+	}
+	j, runID, err := claim(ctx, tx, jobID, workerID, token, deadline)
+	if err != nil || j == nil {
+		return j, runID, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, uuid.Nil, fmt.Errorf("commit claim: %w", err)
+	}
+	return j, runID, nil
+}
+
+func claim(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, jobID uuid.UUID, workerID string, token uuid.UUID, deadline time.Time) (*job.Job, uuid.UUID, error) {
+	runID := uuid.New()
+	j, err := scanJob(q.QueryRow(ctx, claimSQL, jobID, time.Now(), workerID, token, deadline, runID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, uuid.Nil, nil
 	}
@@ -657,6 +700,8 @@ type Tenant struct {
 	Status    string
 	// WebhookSecret signs this tenant's webhook requests ("whsec_" + base64).
 	WebhookSecret string
+	// MaxConcurrency caps how many of this tenant's jobs run at once; 0 is unlimited.
+	MaxConcurrency int
 }
 
 // NewWebhookSecret returns a fresh Standard Webhooks signing secret.
@@ -689,9 +734,9 @@ func RotateWebhookSecret(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UU
 func GetTenant(ctx context.Context, db *pgxpool.Pool, id uuid.UUID) (*Tenant, error) {
 	var t Tenant
 	err := db.QueryRow(ctx, `
-		SELECT id, name, rate_limit, weight, status, webhook_secret
+		SELECT id, name, rate_limit, weight, status, webhook_secret, max_concurrency
 		FROM tenants WHERE id = $1 AND status = 'active'`, id).
-		Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret)
+		Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret, &t.MaxConcurrency)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -719,9 +764,9 @@ func NewAPIKey() (string, error) {
 func GetTenantByAPIKey(ctx context.Context, db *pgxpool.Pool, apiKey string) (*Tenant, error) {
 	var t Tenant
 	err := db.QueryRow(ctx, `
-		SELECT id, name, rate_limit, weight, status, webhook_secret
+		SELECT id, name, rate_limit, weight, status, webhook_secret, max_concurrency
 		FROM tenants WHERE api_key_hash = $1 AND status = 'active'`, HashAPIKey(apiKey)).
-		Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret)
+		Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret, &t.MaxConcurrency)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -733,7 +778,7 @@ func GetTenantByAPIKey(ctx context.Context, db *pgxpool.Pool, apiKey string) (*T
 
 // InsertTenant creates an active tenant and returns its plaintext API key,
 // which is not recoverable afterwards.
-func InsertTenant(ctx context.Context, db *pgxpool.Pool, name string, rateLimit, weight int) (*Tenant, string, error) {
+func InsertTenant(ctx context.Context, db *pgxpool.Pool, name string, rateLimit, weight, maxConcurrency int) (*Tenant, string, error) {
 	key, err := NewAPIKey()
 	if err != nil {
 		return nil, "", err
@@ -742,15 +787,45 @@ func InsertTenant(ctx context.Context, db *pgxpool.Pool, name string, rateLimit,
 	if err != nil {
 		return nil, "", err
 	}
-	t := &Tenant{ID: uuid.New(), Name: name, RateLimit: rateLimit, Weight: weight, Status: "active", WebhookSecret: secret}
+	t := &Tenant{ID: uuid.New(), Name: name, RateLimit: rateLimit, Weight: weight, Status: "active",
+		WebhookSecret: secret, MaxConcurrency: maxConcurrency}
 	_, err = db.Exec(ctx, `
-		INSERT INTO tenants (id, name, api_key_hash, rate_limit, weight, status, webhook_secret)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		t.ID, t.Name, HashAPIKey(key), t.RateLimit, t.Weight, t.Status, t.WebhookSecret)
+		INSERT INTO tenants (id, name, api_key_hash, rate_limit, weight, status, webhook_secret, max_concurrency)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		t.ID, t.Name, HashAPIKey(key), t.RateLimit, t.Weight, t.Status, t.WebhookSecret, t.MaxConcurrency)
 	if err != nil {
 		return nil, "", fmt.Errorf("insert tenant: %w", err)
 	}
 	return t, key, nil
+}
+
+// TenantLimits holds optional new values for UpdateTenantLimits; nil leaves a field unchanged.
+type TenantLimits struct {
+	RateLimit      *int
+	Weight         *int
+	MaxConcurrency *int
+}
+
+// UpdateTenantLimits changes a tenant's rate limit, fair-queuing weight and/or
+// concurrency cap. API replicas and workers pick changes up within seconds.
+func UpdateTenantLimits(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UUID, l TenantLimits) (*Tenant, error) {
+	var t Tenant
+	err := db.QueryRow(ctx, `
+		UPDATE tenants SET
+			rate_limit      = COALESCE($2, rate_limit),
+			weight          = COALESCE($3, weight),
+			max_concurrency = COALESCE($4, max_concurrency)
+		WHERE id = $1
+		RETURNING id, name, rate_limit, weight, status, webhook_secret, max_concurrency`,
+		tenantID, l.RateLimit, l.Weight, l.MaxConcurrency).
+		Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret, &t.MaxConcurrency)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("update tenant limits: %w", err)
+	}
+	return &t, nil
 }
 
 // RotateAPIKey replaces a tenant's API key and returns the new plaintext key.
@@ -887,7 +962,7 @@ func ListDeadLetter(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UUID, l
 // Used by workers to build the weighted-fair-queue dequeue set.
 func GetTenants(ctx context.Context, db *pgxpool.Pool) ([]*Tenant, error) {
 	rows, err := db.Query(ctx, `
-		SELECT id, name, rate_limit, weight, status, webhook_secret
+		SELECT id, name, rate_limit, weight, status, webhook_secret, max_concurrency
 		FROM tenants WHERE status = 'active'`)
 	if err != nil {
 		return nil, fmt.Errorf("get tenants: %w", err)
@@ -896,7 +971,7 @@ func GetTenants(ctx context.Context, db *pgxpool.Pool) ([]*Tenant, error) {
 	var out []*Tenant
 	for rows.Next() {
 		var t Tenant
-		if err := rows.Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.RateLimit, &t.Weight, &t.Status, &t.WebhookSecret, &t.MaxConcurrency); err != nil {
 			return nil, fmt.Errorf("scan tenant: %w", err)
 		}
 		out = append(out, &t)

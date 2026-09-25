@@ -320,3 +320,66 @@ func TestWorker_PicksUpNewTenantQuickly(t *testing.T) {
 		t.Fatalf("new tenant's job took %v to run, want well under 10s", took)
 	}
 }
+
+// A capped tenant never runs more than max_concurrency jobs at once, and doesn't
+// hold back an uncapped tenant sharing the same worker.
+func TestWorker_EnforcesTenantConcurrencyLimit(t *testing.T) {
+	ctx := context.Background()
+	db := testutil.DB(t)
+	q := queue.New(testutil.Redis(t))
+	capped, _ := testutil.Tenant(t, db, 0, 100)
+	free, _ := testutil.Tenant(t, db, 0, 100)
+	two := 2
+	if _, err := storage.UpdateTenantLimits(ctx, db, capped.ID, storage.TenantLimits{MaxConcurrency: &two}); err != nil {
+		t.Fatal(err)
+	}
+
+	type counter struct{ running, peak atomic.Int32 }
+	var cappedC, freeC counter
+	track := func(c *counter) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			n := c.running.Add(1)
+			for p := c.peak.Load(); n > p && !c.peak.CompareAndSwap(p, n); p = c.peak.Load() {
+			}
+			time.Sleep(400 * time.Millisecond)
+			c.running.Add(-1)
+		}
+	}
+	cappedSrv := httptest.NewServer(track(&cappedC))
+	defer cappedSrv.Close()
+	freeSrv := httptest.NewServer(track(&freeC))
+	defer freeSrv.Close()
+
+	w := worker.New(db, q, worker.Options{Concurrency: 10, AllowPrivateWebhooks: true})
+	runCtx, cancel := context.WithCancel(context.Background())
+	go w.Run(runCtx)
+	defer func() { cancel(); w.Shutdown(5 * time.Second) }()
+	time.Sleep(300 * time.Millisecond) // tenant limits loaded
+
+	var all []*job.Job
+	for i := 0; i < 6; i++ {
+		j := testutil.InsertJob(t, db, capped.ID, cappedSrv.URL, nil)
+		q.Enqueue(ctx, capped.ID, j.ID, j.Priority)
+		all = append(all, j)
+	}
+	for i := 0; i < 4; i++ {
+		j := testutil.InsertJob(t, db, free.ID, freeSrv.URL, nil)
+		q.Enqueue(ctx, free.ID, j.ID, j.Priority)
+		all = append(all, j)
+	}
+
+	testutil.Eventually(t, 20*time.Second, "all jobs succeeded", func() bool {
+		for _, j := range all {
+			if jobState(t, ctx, db, j) != job.StateSucceeded {
+				return false
+			}
+		}
+		return true
+	})
+	if p := cappedC.peak.Load(); p > 2 {
+		t.Fatalf("capped tenant peaked at %d concurrent jobs, limit is 2", p)
+	}
+	if p := freeC.peak.Load(); p < 3 {
+		t.Fatalf("uncapped tenant peaked at only %d concurrent jobs; the cap shouldn't hold it back", p)
+	}
+}

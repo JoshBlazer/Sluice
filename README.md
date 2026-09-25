@@ -94,7 +94,7 @@ Priority is an integer from `1` (highest) to `10` (lowest), in three lanes: `1` 
 API keys are stored only as SHA-256 hashes. Create a tenant and get its key with the admin CLI:
 
 ```bash
-go run ./cmd/sluice-cli create-tenant -rate-limit 200 -weight 100 acme
+go run ./cmd/sluice-cli create-tenant -rate-limit 200 -weight 100 -max-concurrency 50 acme
 go run ./cmd/sluice-cli rotate-key <tenant-id>   # revokes the old key (API replicas cache keys for up to 10s)
 ```
 
@@ -161,6 +161,7 @@ Jobs are **webhooks**: an HTTP request (`GET`, `POST`, `PUT`, `PATCH` or `DELETE
 
 - Per-tenant API keys
 - Per-tenant rate limits (token bucket, jobs/sec)
+- Per-tenant concurrency limits (`max_concurrency`): a capped tenant never has more jobs running than its cap, even with many workers claiming at once, and a busy tenant can't occupy every worker slot
 - Strict priority lanes across tenants (any tenant's urgent job runs before everything normal), with weighted fair queuing between tenants inside each lane
 - Every API, stats and dashboard view is scoped to the caller's tenant
 - Per-tenant metrics
@@ -448,6 +449,9 @@ sluice-cli queue-depth
 sluice-cli create-tenant [-rate-limit N] [-weight N] <name>
 sluice-cli rotate-key <tenant-id>
 sluice-cli rotate-webhook-secret <tenant-id>
+
+# Change limits (API replicas and workers pick changes up within seconds)
+sluice-cli set-tenant-limits -max-concurrency 20 -rate-limit 500 <tenant-id>
 ```
 
 ---
