@@ -3,7 +3,6 @@ package queue
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"math/rand"
 	"strings"
 	"time"
@@ -83,12 +82,38 @@ const EnqueuedTTL = 10 * time.Minute
 // enqueueScript pushes the job only if its marker was newly set, so every
 // re-enqueue path (API, scheduler, reconciler, reaper) is idempotent while the
 // job is still waiting in Redis.
+// It also drops a token on the wake list, to rouse an idle worker.
 var enqueueScript = redis.NewScript(`
 if redis.call('SET', KEYS[2], '1', 'NX', 'EX', ARGV[2]) then
   redis.call('LPUSH', KEYS[1], ARGV[1])
+  redis.call('LPUSH', KEYS[3], '1')
+  redis.call('LTRIM', KEYS[3], 0, 999)
   return 1
 end
 return 0
+`)
+
+// wakeKey holds tokens that wake workers blocked waiting for jobs. Tokens carry
+// no job: losing one costs at most a poll interval, never a job.
+const wakeKey = "queue:wake"
+
+// popScript atomically takes the first job from KEYS[1..n-2] (in priority and
+// tenant order), clears its enqueued marker, and records it in the worker's
+// processing list KEYS[n-1]. There is no moment at which a popped job is in no
+// list: if the worker dies, the job is in its processing list, which the
+// scheduler recovers.
+var popScript = redis.NewScript(`
+local dest = KEYS[#KEYS - 1]
+for i = 1, #KEYS - 2 do
+  local v = redis.call('RPOP', KEYS[i])
+  if v then
+    redis.call('DEL', ARGV[1] .. v)
+    redis.call('LPUSH', dest, v)
+    redis.call('EXPIRE', dest, ARGV[2])
+    return {KEYS[i], v}
+  end
+end
+return false
 `)
 
 // Ping checks that Redis is reachable.
@@ -100,7 +125,7 @@ func (q *Queue) Ping(ctx context.Context) error {
 // job is already waiting there.
 func (q *Queue) Enqueue(ctx context.Context, tenantID uuid.UUID, jobID uuid.UUID, priority int16) error {
 	key := bucketForPriority(priority) + ":" + tenantID.String()
-	err := enqueueScript.Run(ctx, q.rdb, []string{key, enqueuedPrefix + jobID.String()},
+	err := enqueueScript.Run(ctx, q.rdb, []string{key, enqueuedPrefix + jobID.String(), wakeKey},
 		jobID.String(), int(EnqueuedTTL.Seconds())).Err()
 	if err != nil {
 		return fmt.Errorf("enqueue job %s to %s: %w", jobID, key, err)
@@ -130,7 +155,7 @@ type Item struct {
 // the worker couldn't claim it because Postgres was unavailable. Like Enqueue it
 // is a no-op if the job is already waiting.
 func (q *Queue) Requeue(ctx context.Context, item Item) error {
-	err := enqueueScript.Run(ctx, q.rdb, []string{item.List, enqueuedPrefix + item.JobID.String()},
+	err := enqueueScript.Run(ctx, q.rdb, []string{item.List, enqueuedPrefix + item.JobID.String(), wakeKey},
 		item.JobID.String(), int(EnqueuedTTL.Seconds())).Err()
 	if err != nil {
 		return fmt.Errorf("requeue job %s to %s: %w", item.JobID, item.List, err)
@@ -150,44 +175,44 @@ func (q *Queue) Pop(ctx context.Context, workerID string, tenants []TenantWeight
 	}
 
 	order := weightedShuffle(tenants)
-	keys := make([]string, 0, len(priorityBuckets)*len(order))
+	keys := make([]string, 0, len(priorityBuckets)*len(order)+2)
 	for _, bucket := range priorityBuckets {
 		for _, tenantID := range order {
 			keys = append(keys, bucket+":"+tenantID.String())
 		}
 	}
+	keys = append(keys, processingPrefix+workerID, wakeKey)
 
-	// BLMPOP takes from the first non-empty key in order and wakes as soon as any
-	// key receives a job, so pickup latency is a round trip, not a poll interval.
-	list, vals, err := q.rdb.BLMPop(ctx, timeout, "right", 1, keys...).Result()
-	if err == redis.Nil {
-		return Item{}, nil
-	}
-	if err != nil {
-		if ctx.Err() != nil {
-			return Item{}, ctx.Err()
+	deadline := time.Now().Add(timeout)
+	for {
+		res, err := popScript.Run(ctx, q.rdb, keys, enqueuedPrefix, int(processingTTL.Seconds())).StringSlice()
+		if err == nil && len(res) == 2 {
+			id, perr := uuid.Parse(res[1])
+			if perr != nil {
+				return Item{}, fmt.Errorf("malformed job id %q in queue: %w", res[1], perr)
+			}
+			return Item{JobID: id, List: res[0]}, nil
 		}
-		return Item{}, fmt.Errorf("dequeue: %w", err)
-	}
-	id, err := uuid.Parse(vals[0])
-	if err != nil {
-		return Item{}, fmt.Errorf("malformed job id %q in queue: %w", vals[0], err)
-	}
+		if err != nil && err != redis.Nil {
+			if ctx.Err() != nil {
+				return Item{}, ctx.Err()
+			}
+			return Item{}, fmt.Errorf("dequeue: %w", err)
+		}
 
-	// Clearing the marker lets the job be enqueued again (e.g. after a failed claim or
-	// a retry). The processing list only aids debugging: ownership and recovery are
-	// driven by Postgres claims, and a job lost between the pop and this pipeline is
-	// re-enqueued by the scheduler's pending reconciler once its marker expires. The
-	// TTL stops lists of crashed workers accumulating forever.
-	dest := processingPrefix + workerID
-	pipe := q.rdb.Pipeline()
-	pipe.Del(ctx, enqueuedPrefix+id.String())
-	pipe.LPush(ctx, dest, id.String())
-	pipe.Expire(ctx, dest, processingTTL)
-	if _, err := pipe.Exec(ctx); err != nil {
-		slog.Warn("record processing list", "worker_id", workerID, "job_id", id, "err", err)
+		// Nothing queued for these tenants: sleep until an enqueue drops a wake
+		// token (or the timeout), then look again.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return Item{}, nil
+		}
+		if err := q.rdb.BLPop(ctx, remaining, wakeKey).Err(); err != nil && err != redis.Nil {
+			if ctx.Err() != nil {
+				return Item{}, ctx.Err()
+			}
+			return Item{}, fmt.Errorf("wait for jobs: %w", err)
+		}
 	}
-	return Item{JobID: id, List: list}, nil
 }
 
 // MarkAlive records that workerID is running. A worker that stops refreshing
