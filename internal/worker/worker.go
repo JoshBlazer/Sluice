@@ -54,6 +54,7 @@ type Worker struct {
 
 	tenantsMu sync.RWMutex
 	tenants   []queue.TenantWeight
+	secrets   map[uuid.UUID]string // tenant ID -> webhook signing secret
 }
 
 func New(db *pgxpool.Pool, q *queue.Queue, opts Options) *Worker {
@@ -193,7 +194,9 @@ func (w *Worker) loadTenants(ctx context.Context) {
 		return
 	}
 	weights := make([]queue.TenantWeight, len(tenants))
+	secrets := make(map[uuid.UUID]string, len(tenants))
 	for i, t := range tenants {
+		secrets[t.ID] = t.WebhookSecret
 		w := t.Weight
 		if w <= 0 {
 			w = 100
@@ -202,12 +205,29 @@ func (w *Worker) loadTenants(ctx context.Context) {
 	}
 	w.tenantsMu.Lock()
 	w.tenants = weights
+	w.secrets = secrets
 	w.tenantsMu.Unlock()
 	slog.Info("tenant weights loaded", "count", len(weights))
 }
 
 // process claims and executes one popped job. It returns false if the claim hit a
 // database error, after putting the job back on its queue.
+// webhookSecret returns the tenant's signing secret from the refreshed cache,
+// falling back to Postgres for a tenant created since the last refresh.
+func (w *Worker) webhookSecret(ctx context.Context, tenantID uuid.UUID) (string, error) {
+	w.tenantsMu.RLock()
+	secret, ok := w.secrets[tenantID]
+	w.tenantsMu.RUnlock()
+	if ok {
+		return secret, nil
+	}
+	t, err := storage.GetTenant(ctx, w.db, tenantID)
+	if err != nil {
+		return "", fmt.Errorf("load webhook secret for tenant %s: %w", tenantID, err)
+	}
+	return t.WebhookSecret, nil
+}
+
 func (w *Worker) process(ctx context.Context, item queue.Item) bool {
 	jobID := item.JobID
 	tracer := telemetry.Tracer("sluice/worker")

@@ -56,6 +56,8 @@ func main() {
 		cmdCreateTenant(ctx, db, flag.Args()[1:])
 	case "rotate-key":
 		cmdRotateKey(ctx, db, flag.Args()[1:])
+	case "rotate-webhook-secret":
+		cmdRotateWebhookSecret(ctx, db, flag.Args()[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", flag.Arg(0))
 		usage()
@@ -212,7 +214,27 @@ func cmdCreateTenant(ctx context.Context, db *pgxpool.Pool, args []string) {
 	if err != nil {
 		fatalf("create tenant: %v", err)
 	}
-	fmt.Printf("tenant id: %s\napi key:   %s\n\nStore the key now — only its hash is kept.\n", t.ID, key)
+	fmt.Printf("tenant id:      %s\napi key:        %s\nwebhook secret: %s\n\n"+
+		"Store the API key now — only its hash is kept. The webhook secret verifies Sluice's\n"+
+		"requests to your endpoints; it can be fetched later from GET /v1/webhook-secret.\n",
+		t.ID, key, t.WebhookSecret)
+}
+
+func cmdRotateWebhookSecret(ctx context.Context, db *pgxpool.Pool, args []string) {
+	if len(args) != 1 {
+		fatalf("usage: sluice-cli rotate-webhook-secret <tenant-id>")
+	}
+	tenantID, err := uuid.Parse(args[0])
+	if err != nil {
+		fatalf("invalid tenant id: %v", err)
+	}
+	secret, err := storage.RotateWebhookSecret(ctx, db, tenantID)
+	if err != nil {
+		fatalf("rotate webhook secret: %v", err)
+	}
+	fmt.Printf("new webhook secret: %s\n\n"+
+		"Workers sign with it within a minute (or immediately after SIGHUP). Have your\n"+
+		"receivers accept both the old and new secret until then.\n", secret)
 }
 
 func cmdRotateKey(ctx context.Context, db *pgxpool.Pool, args []string) {
@@ -402,6 +424,8 @@ Commands:
   create-tenant       create a tenant and print its API key
                       (flags: -rate-limit N, -weight N)
   rotate-key <id>     issue a new API key for a tenant, revoking the old one
+  rotate-webhook-secret <id>
+                      issue a new webhook signing secret for a tenant
 
 Flags:`)
 	flag.PrintDefaults()

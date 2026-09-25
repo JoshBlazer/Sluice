@@ -92,4 +92,19 @@ type WebhookPayload struct {
 	Method  string            `json:"method,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
 	Body    json.RawMessage   `json:"body,omitempty"`
+	// TimeoutSeconds bounds the whole request. Zero means DefaultWebhookTimeout.
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+}
+
+const (
+	DefaultWebhookTimeout = 25 * time.Second
+	MaxWebhookTimeout     = 900 * time.Second
+)
+
+// Timeout returns the request timeout for this webhook.
+func (p WebhookPayload) Timeout() time.Duration {
+	if p.TimeoutSeconds == 0 {
+		return DefaultWebhookTimeout
+	}
+	return time.Duration(p.TimeoutSeconds) * time.Second
 }
