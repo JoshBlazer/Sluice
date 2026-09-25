@@ -286,3 +286,47 @@ func TestRecoverDeadWorkerJobs(t *testing.T) {
 		t.Fatalf("live worker's job %s was re-enqueued too", again)
 	}
 }
+
+// Thousands of jobs falling due at the same moment (a cron fan-out, a scheduled
+// campaign) must go out in one poll, not a batch per 100ms tick.
+func TestPollScheduledJobs_ReleasesLargeBacklogInOnePoll(t *testing.T) {
+	ctx := context.Background()
+	db := testutil.DB(t)
+	q := queue.New(testutil.Redis(t))
+	tn, _ := testutil.Tenant(t, db, 0, 100)
+	s := New(db, q)
+
+	const n = 5000 // priorities 1, 5, 10 in turn
+	if _, err := db.Exec(ctx, `
+		INSERT INTO jobs (id, tenant_id, type, payload, priority, state, run_at)
+		SELECT gen_random_uuid(), $1, 'webhook', '{"url":"https://example.com"}',
+		       (ARRAY[1, 5, 10])[1 + i % 3], 'scheduled', NOW() - INTERVAL '1 second'
+		FROM generate_series(1, $2) AS i`, tn.ID, n); err != nil {
+		t.Fatalf("insert scheduled jobs: %v", err)
+	}
+
+	start := time.Now()
+	s.pollScheduledJobs(ctx)
+	t.Logf("released %d due jobs in %v", n, time.Since(start))
+
+	var scheduled, pending int
+	if err := db.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE state = 'scheduled'), count(*) FILTER (WHERE state = 'pending')
+		FROM jobs WHERE tenant_id = $1`, tn.ID).Scan(&scheduled, &pending); err != nil {
+		t.Fatal(err)
+	}
+	if scheduled != 0 || pending != n {
+		t.Fatalf("after one poll: %d scheduled, %d pending; want 0 and %d", scheduled, pending, n)
+	}
+	depths, err := q.Depths(ctx, []uuid.UUID{tn.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// i in 1..n: i%3 == 0 → priority 1, == 1 → 5, == 2 → 10
+	want := map[string]int64{"high": n / 3, "normal": (n + 2) / 3, "low": (n + 1) / 3}
+	for _, d := range depths {
+		if d.Depth != want[d.Priority] {
+			t.Errorf("%s lane holds %d jobs, want %d", d.Priority, d.Depth, want[d.Priority])
+		}
+	}
+}

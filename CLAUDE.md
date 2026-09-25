@@ -285,6 +285,8 @@ Beyond the original plan (all merged, 2026-09-23 to 2026-09-25):
 - max_retries = retries after the first attempt (max_retries=3 → 4 executions); first retry waits backoff_seconds
 - Workers run --concurrency jobs at once; drain on SIGTERM; --shutdown-timeout aborts and records the attempt
 - Dequeue is an atomic Lua pop into the worker's processing list; idle workers block on the queue:wake token list
+- Due and retry-ready jobs are released in batches (storage.PromoteDueScheduled / PromoteReadyFailed: one
+  UPDATE ... SKIP LOCKED per 1,000, queue.EnqueueMany pipelined); GetDueJobs is gone. 5,000 due at once: 2m13s → 2.5s locally
 - Enqueue is idempotent via an enqueued:{job_id} marker; `sluice-cli drain` clears markers too
 - Workers publish worker-alive:{id} keys; the scheduler recovers a dead worker's jobs (~20s)
 - Pending reconciler pages through Postgres to rebuild Redis after data loss
