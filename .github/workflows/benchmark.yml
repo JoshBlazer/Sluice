@@ -70,7 +70,8 @@ jobs:
 
       - name: Runner hardware
         # GitHub assigns different CPU models; results differ by up to 2x between them.
-        run: echo "$(nproc) vCPU, $(lscpu | awk -F: '/Model name/{gsub(/^ +/,"",$2); print $2}')"
+        run: |
+          echo "$(nproc) vCPU, $(lscpu | awk -F: '/Model name/{gsub(/^ +/,"",$2); print $2}')"
 
       - name: Build
         run: |
