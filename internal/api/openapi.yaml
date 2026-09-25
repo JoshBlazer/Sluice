@@ -1,0 +1,411 @@
+openapi: 3.1.0
+info:
+  title: Sluice API
+  version: "1"
+  description: |
+    Durable, multi-tenant job scheduling. Every /v1 endpoint needs a tenant API key
+    (`Authorization: Bearer <key>`) and only sees that tenant's data.
+
+    Jobs are webhooks. Each request Sluice sends is signed with the tenant's secret
+    using Standard Webhooks (`webhook-id`, `webhook-timestamp`, `webhook-signature`).
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://localhost:8080
+security:
+  - apiKey: []
+
+paths:
+  /v1/jobs:
+    post:
+      summary: Submit a job
+      description: |
+        Returns only after the job is committed to Postgres. With an
+        `idempotency_key` that was used before, returns the original job (200)
+        instead of creating another.
+      operationId: submitJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SubmitJob"}
+      responses:
+        "201": {description: Created, content: {application/json: {schema: {$ref: "#/components/schemas/Job"}}}}
+        "200": {description: Existing job with the same idempotency key, content: {application/json: {schema: {$ref: "#/components/schemas/Job"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "429":
+          description: Tenant rate limit exceeded
+          headers:
+            Retry-After: {schema: {type: integer}, description: Seconds to wait}
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    get:
+      summary: List jobs, newest first
+      operationId: listJobs
+      parameters:
+        - {name: state, in: query, schema: {$ref: "#/components/schemas/JobState"}}
+        - {name: retried, in: query, schema: {type: boolean}, description: Only jobs with at least one failed attempt}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 50}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0, default: 0}}
+      responses:
+        "200":
+          description: Jobs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs: {type: [array, "null"], items: {$ref: "#/components/schemas/Job"}}
+                  count: {type: integer}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/jobs/{id}:
+    get:
+      summary: Get a job
+      operationId: getJob
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: The job, content: {application/json: {schema: {$ref: "#/components/schemas/Job"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /v1/jobs/{id}/runs:
+    get:
+      summary: A job's attempt history, oldest first
+      operationId: listJobRuns
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200":
+          description: Attempts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runs: {type: array, items: {$ref: "#/components/schemas/JobRun"}}
+                  count: {type: integer}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /v1/jobs/{id}/cancel:
+    post:
+      summary: Cancel a job that hasn't started, or is waiting to retry
+      operationId: cancelJob
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "204": {description: Cancelled}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /v1/jobs/{id}/replay:
+    post:
+      summary: Run a dead job again from its first attempt
+      operationId: replayJob
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: "The job, back to pending", content: {application/json: {schema: {$ref: "#/components/schemas/Job"}}}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /v1/webhook-secret:
+    get:
+      summary: The tenant's webhook signing secret
+      description: Receivers use it to verify Sluice's requests with any Standard Webhooks library.
+      operationId: getWebhookSecret
+      responses:
+        "200":
+          description: Secret
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret: {type: string, examples: ["whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"]}
+                  scheme: {type: string, const: standard-webhooks-v1}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/schedules:
+    post:
+      summary: Create a recurring (cron) schedule
+      operationId: createSchedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, cron, job_template]
+              properties:
+                name: {type: string}
+                cron: {type: string, description: "Five-field cron expression", examples: ["0 2 * * *"]}
+                timezone: {type: string, default: UTC, examples: ["Europe/London"]}
+                job_template: {$ref: "#/components/schemas/JobTemplate"}
+      responses:
+        "201": {description: Created, content: {application/json: {schema: {$ref: "#/components/schemas/Schedule"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+    get:
+      summary: List schedules
+      operationId: listSchedules
+      responses:
+        "200":
+          description: Schedules
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schedules: {type: [array, "null"], items: {$ref: "#/components/schemas/Schedule"}}
+                  count: {type: integer}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/schedules/{id}:
+    get:
+      summary: Get a schedule
+      operationId: getSchedule
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: The schedule, content: {application/json: {schema: {$ref: "#/components/schemas/Schedule"}}}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      summary: Delete a schedule
+      operationId: deleteSchedule
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "204": {description: Deleted}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /v1/stats:
+    get:
+      summary: Queue depths and job counts for the tenant
+      operationId: getStats
+      responses:
+        "200": {description: Snapshot, content: {application/json: {schema: {$ref: "#/components/schemas/Stats"}}}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/stats/runs:
+    get:
+      summary: Most recent attempts across the tenant's jobs
+      operationId: listRecentRuns
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 50}}
+      responses:
+        "200":
+          description: Attempts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runs: {type: array, items: {$ref: "#/components/schemas/JobRun"}}
+                  count: {type: integer}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/stats/dead-letter:
+    get:
+      summary: Most recent dead-letter entries
+      operationId: listDeadLetter
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 50}}
+      responses:
+        "200":
+          description: Entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries: {type: [array, "null"], items: {$ref: "#/components/schemas/DeadLetterEntry"}}
+                  count: {type: integer}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /ws:
+    get:
+      summary: Live stats over WebSocket
+      description: Browsers can't set headers on a WebSocket handshake, so the key goes in `token`. Sends a Stats snapshot every second.
+      operationId: streamStats
+      security: []
+      parameters:
+        - {name: token, in: query, required: true, schema: {type: string}}
+      responses:
+        "101": {description: Switching to WebSocket; messages are Stats objects}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /healthz:
+    get:
+      summary: Liveness
+      operationId: healthz
+      security: []
+      responses:
+        "200": {description: The process is up}
+
+  /readyz:
+    get:
+      summary: Readiness (Postgres and Redis reachable)
+      operationId: readyz
+      security: []
+      responses:
+        "200": {description: Ready, content: {application/json: {schema: {$ref: "#/components/schemas/Readiness"}}}}
+        "503": {description: Not ready, content: {application/json: {schema: {$ref: "#/components/schemas/Readiness"}}}}
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      operationId: metrics
+      security: []
+      responses:
+        "200": {description: Prometheus text format, content: {text/plain: {}}}
+
+  /openapi.yaml:
+    get:
+      summary: This document
+      operationId: openapi
+      security: []
+      responses:
+        "200": {description: OpenAPI 3.1 document, content: {application/yaml: {}}}
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: A tenant API key (sk_...), issued by `sluice-cli create-tenant`
+
+  parameters:
+    ID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+
+  responses:
+    BadRequest: {description: Invalid input, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+    Unauthorized: {description: Missing or invalid API key, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+    NotFound: {description: "Not found, or belongs to another tenant", content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+    Conflict: {description: Duplicate, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: {type: string}
+
+    JobState:
+      type: string
+      enum: [pending, scheduled, claimed, running, succeeded, failed, dead, cancelled]
+      description: "`failed` means waiting to retry after a backoff; `dead` means retries are exhausted."
+
+    WebhookPayload:
+      type: object
+      required: [url]
+      properties:
+        url: {type: string, format: uri, description: "Absolute http(s) URL. Private and internal addresses are refused."}
+        method: {type: string, enum: [GET, POST, PUT, PATCH, DELETE], default: POST}
+        headers: {type: object, additionalProperties: {type: string}}
+        body: {description: "Any JSON value, sent as the request body"}
+        timeout_seconds: {type: integer, minimum: 1, maximum: 900, default: 25}
+
+    JobTemplate:
+      type: object
+      required: [type, payload]
+      properties:
+        type: {type: string, const: webhook}
+        payload: {$ref: "#/components/schemas/WebhookPayload"}
+        priority: {type: integer, minimum: 1, maximum: 10, default: 5, description: "1 = highest"}
+        max_retries: {type: integer, minimum: 0, maximum: 100, default: 3, description: Retries after the first attempt}
+        backoff_seconds: {type: integer, minimum: 1, maximum: 86400, default: 30, description: First retry delay; doubles each retry}
+
+    SubmitJob:
+      allOf:
+        - $ref: "#/components/schemas/JobTemplate"
+        - type: object
+          properties:
+            run_at: {type: string, format: date-time, description: Run at this time instead of now}
+            idempotency_key: {type: string, minLength: 1, maxLength: 255}
+
+    Job:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        type: {type: string}
+        payload: {$ref: "#/components/schemas/WebhookPayload"}
+        priority: {type: integer}
+        state: {$ref: "#/components/schemas/JobState"}
+        run_at: {type: string, format: date-time}
+        claimed_at: {type: string, format: date-time}
+        claimed_by: {type: string}
+        deadline: {type: string, format: date-time}
+        attempt: {type: integer, description: Failed attempts so far}
+        max_retries: {type: integer}
+        backoff_seconds: {type: integer}
+        idempotency_key: {type: string}
+        last_error: {type: string}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+
+    JobRun:
+      type: object
+      properties:
+        run_id: {type: string, format: uuid}
+        job_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        type: {type: string}
+        attempt: {type: integer, description: 0 for the first attempt}
+        state: {$ref: "#/components/schemas/JobState"}
+        duration_ms: {type: [integer, "null"]}
+        started_at: {type: string, format: date-time}
+        finished_at: {type: [string, "null"], format: date-time}
+        error: {type: string}
+
+    Schedule:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        name: {type: string}
+        cron: {type: string}
+        timezone: {type: string}
+        job_template: {$ref: "#/components/schemas/JobTemplate"}
+        enabled: {type: boolean}
+        last_run_at: {type: string, format: date-time}
+        next_run_at: {type: string, format: date-time}
+
+    DeadLetterEntry:
+      type: object
+      properties:
+        job_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        attempt_count: {type: integer}
+        final_error: {type: string}
+        moved_at: {type: string, format: date-time}
+
+    Stats:
+      type: object
+      properties:
+        queues:
+          type: array
+          items:
+            type: object
+            properties:
+              tenant_id: {type: string, format: uuid}
+              tenant: {type: string}
+              priority: {type: string, enum: [high, normal, low]}
+              depth: {type: integer}
+        jobs_by_state:
+          type: object
+          additionalProperties: {type: integer}
+        timestamp: {type: string, format: date-time}
+
+    Readiness:
+      type: object
+      properties:
+        postgres: {type: string, description: '"ok" or the error'}
+        redis: {type: string, description: '"ok" or the error'}

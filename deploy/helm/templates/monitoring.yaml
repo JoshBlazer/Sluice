@@ -1,0 +1,44 @@
+{{- if .Values.monitoring.podMonitor.enabled }}
+# Scrapes /metrics on every Sluice pod (Prometheus Operator). Targets get
+# job="sluice-<role>", which the bundled alert rules expect.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "sluice.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  podMetricsEndpoints:
+    {{- range list "http" "metrics" }}
+    - port: {{ . }}
+      path: /metrics
+      interval: {{ $.Values.monitoring.podMonitor.interval }}
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+          targetLabel: job
+          replacement: sluice-$1
+    {{- end }}
+{{- end }}
+{{- if .Values.monitoring.prometheusRule.enabled }}
+---
+# Alerting rules; the same file works with plain Prometheus (rule_files).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "sluice.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- .Files.Get "files/alerts.yml" | fromYaml | toYaml | nindent 2 }}
+{{- end }}

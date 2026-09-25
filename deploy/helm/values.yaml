@@ -71,3 +71,13 @@ worker:
     maxReplicas: 20
     queueDepthPerReplica: 10
     prometheusAddress: http://prometheus:9090
+
+# Prometheus Operator integration (requires its CRDs).
+monitoring:
+  # Extra labels, e.g. the release label your Prometheus selects on.
+  labels: {}
+  podMonitor:
+    enabled: false
+    interval: 30s
+  prometheusRule:
+    enabled: false

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -18,12 +19,18 @@ import (
 
 const maxBodyBytes = 1 << 20
 
+// openAPISpec documents every route; TestOpenAPICoversAllRoutes keeps it in sync.
+//
+//go:embed openapi.yaml
+var openAPISpec []byte
+
 type Server struct {
 	db      *pgxpool.Pool
 	queue   *queue.Queue
 	limiter *ratelimit.Limiter
 	tenants *tenantCache
 	server  *http.Server
+	router  chi.Router
 }
 
 func New(db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter, port int) *Server {
@@ -44,6 +51,10 @@ func New(db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter, port int)
 	r.Get("/readyz", s.handleReady)
 	r.Handle("/metrics", promhttp.Handler())
 	r.Get("/ws", s.handleWebSocket)
+	r.Get("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/yaml")
+		w.Write(openAPISpec) //nolint:errcheck
+	})
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(authMiddleware(s.tenants))
@@ -68,6 +79,7 @@ func New(db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter, port int)
 		r.Get("/stats/dead-letter", s.handleDeadLetter)
 	})
 
+	s.router = r
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
 		Handler:      s.Handler(r),

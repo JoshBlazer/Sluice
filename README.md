@@ -2,7 +2,7 @@
 
 > A horizontally scalable, durable job scheduler written in Go. At-least-once delivery, exponential backoff, leader-elected HA, and a real dashboard.
 
-[![Go Version](https://img.shields.io/badge/go-1.25+-00ADD8?logo=go)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://golang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/JoshBlazer/Sluice/actions/workflows/ci.yml/badge.svg)](https://github.com/JoshBlazer/Sluice/actions/workflows/ci.yml)
 
@@ -192,6 +192,9 @@ const payload = wh.verify(rawBody, request.headers);
 - **Metrics**: queue depth, processing latency histogram, retry counts, worker health, throughput per tenant
 - **Tracing**: distributed traces from API submission to job completion via OpenTelemetry + Jaeger
 - **Logs**: structured JSON via `log/slog` with correlation IDs threaded through context
+- **Alerts**: [Prometheus rules](deploy/helm/files/alerts.yml) for a missing or duplicated scheduler leader, a growing backlog, job failure spikes, dead-lettering, API errors and latency, throttled tenants and down targets. They're unit-tested with `promtool` in CI. The Helm chart can install them as a `PrometheusRule` plus a `PodMonitor` (`monitoring.*` values); plain Prometheus can load the file via `rule_files`, as the local docker-compose setup does
+- **Grafana**: import [`deploy/monitoring/grafana-dashboard.json`](deploy/monitoring/grafana-dashboard.json) for queue depth, throughput, failure rate, job and API latency, per-worker load and per-tenant views
+- **API reference**: an [OpenAPI 3.1 spec](internal/api/openapi.yaml), also served by every API replica at `/openapi.yaml`. A test fails if any route is missing from it
 - **Dashboard**: real-time queue depth, recent runs, retry histories (per-job attempt timelines), dead-letter inspection. Viewers sign in with a tenant API key and see only that tenant. No key is built into the dashboard, and a signed-in key is kept only for the browser tab
 
 ### Operations
@@ -226,7 +229,7 @@ Design targets are for a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, R
 ## Tech Stack
 
 **Language & Runtime**
-- Go 1.25+ with `log/slog` and context-aware everything
+- Go 1.26+ with `log/slog` and context-aware everything
 
 **APIs & Communication**
 - HTTP/REST via `chi`
@@ -296,7 +299,7 @@ sluice/
 
 ### Prerequisites
 
-- Go 1.25+
+- Go 1.26+
 - Docker + Docker Compose
 - `migrate` CLI: `go install -tags 'pgx5' github.com/golang-migrate/migrate/v4/cmd/migrate@latest`
 - Node 20+ (for the dashboard)
@@ -364,7 +367,7 @@ Two tiers:
 1. **Unit tests** — no I/O. `make test-unit`
 2. **Integration tests** (`-tags integration`) — run the API, worker, scheduler loops, queue and storage against real Postgres and Redis: retries into dead letter, crashed-worker recovery, graceful drain, tenant isolation, rate limits, cron dedup. They use Redis DB 15 and throwaway tenants, so they don't disturb local dev data, and skip if the stack isn't up. `make up && make migrate-up && make test-integration`
 
-CI runs both with `-race` on every push and pull request, and there a missing stack is a failure rather than a skip (`SLUICE_TEST_REQUIRE_INFRA=1`). CI also builds the Docker image, lints and renders the Helm chart, and builds the dashboard.
+CI runs both with `-race` on every push and pull request, and there a missing stack is a failure rather than a skip (`SLUICE_TEST_REQUIRE_INFRA=1`). CI also builds the Docker image, lints and renders the Helm chart, builds the dashboard, and fails on known vulnerabilities (`govulncheck` for Go, `npm audit` for the dashboard's production dependencies). Dependabot proposes dependency updates weekly.
 
 ### Load testing
 
