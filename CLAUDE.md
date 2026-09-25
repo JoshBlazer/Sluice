@@ -212,12 +212,10 @@ When you notice any of the above, stop. Ask whether it's actually needed now.
 ```
 sluice/
 ├── cmd/
-│   ├── api/
-│   ├── scheduler/
-│   ├── worker/
+│   ├── sluice/              # one binary, --role api|scheduler|worker (replaced cmd/api, cmd/scheduler, cmd/worker)
 │   └── sluice-cli/
 ├── internal/
-│   ├── api/
+│   ├── api/                 # includes admin API and openapi.yaml (a test checks every route is in it)
 │   ├── scheduler/
 │   ├── worker/
 │   ├── storage/
@@ -225,34 +223,40 @@ sluice/
 │   ├── job/
 │   ├── tenant/
 │   ├── ratelimit/
-│   └── telemetry/
+│   ├── leader/              # etcd leader election
+│   ├── metrics/
+│   ├── telemetry/
+│   └── testutil/
 ├── migrations/
-├── proto/
 ├── web/
 ├── deploy/
-│   ├── docker/
+│   ├── docker/              # local Prometheus config
 │   ├── k8s/
-│   └── helm/
-├── docs/
-└── scripts/
+│   ├── helm/
+│   ├── kind/                # deps for the CI kind smoke test
+│   └── monitoring/          # Grafana dashboard, promtool alert tests
+├── docs/                    # reference docs; README is the overview
+└── scripts/                 # loadtest/, bench/, chaos.sh, k8s-smoke.sh
 ```
+
+No `proto/`: gRPC was never needed.
 
 ---
 
 ## Dev Environment
 
 ```bash
-# Start dependencies
-docker-compose up -d
+# Start dependencies (postgres, redis, etcd, jaeger, prometheus)
+docker compose up -d
 
 # Run each role
-go run ./cmd/... --role api
-go run ./cmd/... --role scheduler
-go run ./cmd/... --role worker
+go run ./cmd/sluice --role api
+go run ./cmd/sluice --role scheduler
+SLUICE_WEBHOOK_ALLOW_PRIVATE=true go run ./cmd/sluice --role worker
 
 # Tests
-make test          # unit + integration
-make lint          # golangci-lint
+make test          # unit + integration (integration runs with -p 1: packages share the stack)
+make lint          # go vet
 
 # Migrations
 make migrate-up
@@ -265,38 +269,39 @@ make migrate-up
 Update this section at the end of each work session.
 
 ```
-Phase 1 - Core Engine:        [x] COMPLETE — builds, migrations run, end-to-end test passed (job submitted → succeeded)
-Phase 2 - Reliability:        [x] COMPLETE — auth 401/200, idempotency, jitter backoff, cron scheduling, rate limits, admin CLI
-Phase 3 - High Availability:  [x] COMPLETE — etcd leader election, weighted fair queuing, SIGHUP reload, split-brain test, K8s + Helm
-Phase 4 - Observability:      [x] COMPLETE — Prometheus (3/3 targets up), Jaeger traces (sluice-api + sluice-worker), Next.js dashboard live at :3030
+Phase 1 - Core Engine:        [x] COMPLETE
+Phase 2 - Reliability:        [x] COMPLETE
+Phase 3 - High Availability:  [x] COMPLETE (lease TTL 2s, see leader.DefaultTTLSeconds)
+Phase 4 - Observability:      [x] COMPLETE (traces link API submission to worker execution via jobs.trace_context)
+Released: v0.4.0 (2026-09-25): ghcr.io/joshblazer/sluice, public, amd64+arm64; Helm chart on the GitHub Release
 ```
 
-Last worked on: 2026-09-23
-Next task: All phases complete. Hardening pass done on branch `hardening` (see below). Optional: WASM job types, DAG support (see README roadmap).
+Last worked on: 2026-09-25
+Next task: measure submission throughput on target hardware (3 × 4 vCPU) with scripts/bench and put the
+real number in the README performance table. The 10k jobs/sec target is the one README claim not yet backed by a measurement.
 
-Hardening pass (2026-09-23):
-- Finished the Pulse→Sluice rename: Dockerfile, Helm helpers, K8s names (lowercase), env prefix is SLUICE_ (uppercase; Linux is case-sensitive)
+Beyond the original plan (all merged, 2026-09-23 to 2026-09-25):
 - max_retries = retries after the first attempt (max_retries=3 → 4 executions); first retry waits backoff_seconds
-- Workers drain in-flight jobs on SIGTERM; --shutdown-timeout aborts and records the attempt
-- Stats/WebSocket endpoints are tenant-scoped; /ws authenticates via ?token=
-- API keys stored as SHA-256 (migration 7); create/rotate via sluice-cli
-- Webhooks refuse non-public addresses unless SLUICE_WEBHOOK_ALLOW_PRIVATE=true (dev/tests)
-- Cancel sets state 'cancelled' (migration 6) instead of deleting
-- Scheduler leader exports sluice_queue_depth; KEDA scales workers on it
-- Workers run --concurrency jobs at once (default 10). Dequeue is an atomic Lua pop that records the job in the worker's processing list; idle workers block on the queue:wake token list
-- Enqueue is idempotent via an enqueued:{job_id} marker (TTL queue.EnqueuedTTL), so
-  reconciler/reaper re-enqueues don't duplicate waiting jobs; `sluice-cli drain` clears markers too
+- Workers run --concurrency jobs at once; drain on SIGTERM; --shutdown-timeout aborts and records the attempt
+- Dequeue is an atomic Lua pop into the worker's processing list; idle workers block on the queue:wake token list
+- Enqueue is idempotent via an enqueued:{job_id} marker; `sluice-cli drain` clears markers too
+- Workers publish worker-alive:{id} keys; the scheduler recovers a dead worker's jobs (~20s)
+- Pending reconciler pages through Postgres to rebuild Redis after data loss
+- Per-tenant concurrency caps (tenants.max_concurrency, storage.TryClaimLimited)
+- API keys stored as SHA-256; webhooks signed with Standard Webhooks; SSRF guard unless SLUICE_WEBHOOK_ALLOW_PRIVATE=true
+- Retention (--retention-days, default 30) prunes finished jobs, dead letters and old job_runs partitions
+- Admin API at /admin/v1 when SLUICE_ADMIN_TOKEN is set
+- Helm chart runs migrations as a hook job; CI: -race tests, kind smoke test, promtool, govulncheck, npm audit
+- Weekly chaos workflow (scripts/chaos.sh) and benchmark workflow; Release workflow publishes on v* tags
 
 Dev notes:
 - Postgres runs on port 5433 (native Postgres occupies 5432 on this machine)
 - Docker trust auth used for local dev (POSTGRES_HOST_AUTH_METHOD=trust in docker-compose.yml)
-- Race detector (-race) requires MinGW/GCC on Windows — skip locally, runs in CI
-- Go binary: C:\Program Files\Go\bin\go
-- migrate CLI installed with: go install -tags 'pgx5' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+- Go 1.26+ required (go.mod), toolchain go1.27.x; binary at C:\Program Files\Go\bin\go
 - migrate URL format: pgx5://sluice:sluice@localhost:5433/sluice?sslmode=disable
 - etcd runs on port 2379 (quay.io/coreos/etcd:v3.5.16), single-node for local dev
-- Queue keys are now per-tenant: queue:{priority}:{tenantID} — flush Redis when switching from Phase 2 data
-- Integration tests: make test-integration (needs Docker stack + migrations; uses Redis DB 15 and throwaway tenants)
-- Race detector on Windows: run the tests in a golang:1.27 container pointed at host.docker.internal (SLUICE_TEST_POSTGRES_URL / SLUICE_TEST_REDIS_ADDR)
-- Load test: scripts/loadtest (see README "Load testing")
-- SIGHUP reloads tenant weights in worker: kill -SIGHUP <worker-pid> or Send-Signal on Windows
+- Queue keys are per tenant: queue:{1|5|10}:{tenantID} (three priority lanes)
+- Race detector on Windows needs GCC: run the tests in a golang:1.27 container pointed at host.docker.internal (SLUICE_TEST_POSTGRES_URL / SLUICE_TEST_REDIS_ADDR); CI runs -race anyway
+- Dashboard (Next 16): run it from the capital-D path C:\Users\user\Documents\sliuce\web or Turbopack can't resolve modules
+- Load test: scripts/loadtest (docs/testing.md); target-hardware benchmark: scripts/bench (docs/benchmarking.md)
+- SIGHUP reloads tenants in workers: kill -SIGHUP <worker-pid>
