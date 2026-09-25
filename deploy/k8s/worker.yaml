@@ -18,7 +18,7 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: worker
-          image: sluice:latest
+          image: ghcr.io/joshblazer/sluice:latest
           args: ["--role", "worker", "--shutdown-timeout", "45s", "--concurrency", "10"]
           envFrom:
             - configMapRef:

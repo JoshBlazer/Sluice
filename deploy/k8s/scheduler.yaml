@@ -24,7 +24,7 @@ spec:
     spec:
       containers:
         - name: scheduler
-          image: sluice:latest
+          image: ghcr.io/joshblazer/sluice:latest
           args: ["--role", "scheduler"]
           envFrom:
             - configMapRef:

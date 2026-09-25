@@ -24,6 +24,9 @@ import (
 	"github.com/sluice/internal/worker"
 )
 
+// version is set at build time (-ldflags "-X main.version=...").
+var version = "dev"
+
 type config struct {
 	role            string
 	postgresURL     string
@@ -37,6 +40,7 @@ type config struct {
 	webhookPrivate  bool
 	concurrency     int
 	retentionDays   int
+	showVersion     bool
 }
 
 func loadConfig() config {
@@ -57,6 +61,7 @@ func loadConfig() config {
 	flag.IntVar(&c.concurrency, "concurrency", envInt("SLUICE_WORKER_CONCURRENCY", worker.DefaultConcurrency), "jobs a worker runs at once (worker role only)")
 	flag.IntVar(&c.retentionDays, "retention-days", envInt("SLUICE_RETENTION_DAYS", 30), "days to keep finished jobs, run history and dead letters; 0 keeps everything (scheduler role only)")
 	flag.BoolVar(&c.webhookPrivate, "webhook-allow-private", env("SLUICE_WEBHOOK_ALLOW_PRIVATE", "") == "true", "let webhook jobs call loopback/private addresses (local dev only)")
+	flag.BoolVar(&c.showVersion, "version", false, "print the version and exit")
 	flag.Parse()
 	return c
 }
@@ -67,6 +72,11 @@ func main() {
 	})))
 
 	c := loadConfig()
+	if c.showVersion {
+		fmt.Println(version)
+		return
+	}
+	slog.Info("starting sluice", "version", version, "role", c.role)
 	if c.retentionDays < 0 {
 		fmt.Fprintln(os.Stderr, "--retention-days must be 0 (keep everything) or positive")
 		os.Exit(1)

@@ -28,7 +28,16 @@ spec:
           image: {{ include "sluice.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["--role", "scheduler"]
+          ports:
+            - name: metrics
+              containerPort: 9091
           {{- include "sluice.envFrom" . | nindent 10 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 15
           {{- with .Values.etcd.tls.secretName }}
           env:
             - name: SLUICE_ETCD_CA_FILE

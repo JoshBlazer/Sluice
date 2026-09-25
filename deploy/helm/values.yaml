@@ -1,7 +1,13 @@
 image:
-  repository: sluice
-  tag: latest
+  repository: ghcr.io/joshblazer/sluice
+  # Defaults to the chart's appVersion, i.e. the release the chart shipped with.
+  tag: ""
   pullPolicy: IfNotPresent
+
+# Run database migrations (bundled in the image) as a pre-install/pre-upgrade
+# hook. Disable if you manage the schema some other way.
+migrations:
+  enabled: true
 
 # Credentials go into a Secret. To manage it yourself, create a Secret with keys
 # SLUICE_POSTGRES_URL, SLUICE_REDIS_ADDR (and SLUICE_ETCD_PASSWORD if used) and

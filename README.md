@@ -374,16 +374,27 @@ It reports submission throughput, submit latency, and submit→execute latency p
 
 ## Deployment
 
+### Releases
+
+Pushing a tag like `v0.4.0` runs the [Release workflow](.github/workflows/release.yml), which publishes:
+- multi-arch (amd64, arm64) images: `ghcr.io/joshblazer/sluice:0.4.0` and `:latest`
+- the Helm chart, versioned to match, attached to a GitHub Release with generated notes
+
+Each image contains `/sluice`, `/sluice-cli`, the `migrate` CLI and the matching migrations in `/migrations`. `sluice --version` prints the build.
+
 ### Docker image
 
 ```bash
-make docker-build     # sluice:dev, containing /sluice and /sluice-cli
-docker run --rm -e SLUICE_POSTGRES_URL=... -e SLUICE_REDIS_ADDR=... sluice:dev --role worker
+docker run --rm -e SLUICE_POSTGRES_URL=... -e SLUICE_REDIS_ADDR=... ghcr.io/joshblazer/sluice:latest --role worker
+# apply the schema that ships with the image
+docker run --rm --entrypoint /migrate ghcr.io/joshblazer/sluice:latest -path /migrations -database "$SLUICE_POSTGRES_URL" up
 ```
+
+`make docker-build` builds the same image locally as `sluice:dev`.
 
 ### Kubernetes
 
-The chart expects Postgres, Redis and etcd to exist already, and migrations to have been applied.
+The chart expects Postgres, Redis and etcd to exist already. It applies database migrations itself, as a pre-install/pre-upgrade hook job using the image being deployed (set `migrations.enabled=false` to manage the schema yourself). The API has readiness (`/readyz`, which checks Postgres and Redis) and liveness probes; schedulers and workers have liveness probes on their metrics port. CI installs the chart on a throwaway [kind](https://kind.sigs.k8s.io/) cluster and runs a job through it on every push ([`scripts/k8s-smoke.sh`](scripts/k8s-smoke.sh), with test dependencies in `deploy/kind/deps.yaml`).
 
 ```bash
 helm install sluice deploy/helm \

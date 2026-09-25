@@ -1,0 +1,19 @@
+# Apply before rolling out a new image: runs the migrations bundled in it.
+#   kubectl apply -f migrate-job.yaml && kubectl -n sluice wait --for=condition=complete job/sluice-migrate
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sluice-migrate
+  namespace: sluice
+spec:
+  backoffLimit: 4
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: ghcr.io/joshblazer/sluice:latest
+          command: ["/migrate", "-path", "/migrations", "-database", "$(SLUICE_POSTGRES_URL)", "up"]
+          envFrom:
+            - secretRef:
+                name: sluice-secrets
