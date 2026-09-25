@@ -29,6 +29,7 @@ type config struct {
 	postgresURL     string
 	redisAddr       string
 	etcdEndpoints   string
+	etcd            leader.ClientConfig
 	otlpEndpoint    string
 	httpPort        int
 	metricsPort     int
@@ -41,8 +42,13 @@ func loadConfig() config {
 	var c config
 	flag.StringVar(&c.role, "role", env("SLUICE_ROLE", ""), "role to run: api | scheduler | worker")
 	flag.StringVar(&c.postgresURL, "postgres-url", env("SLUICE_POSTGRES_URL", "postgres://sluice:sluice@localhost:5433/sluice?sslmode=disable"), "postgres connection string")
-	flag.StringVar(&c.redisAddr, "redis-addr", env("SLUICE_REDIS_ADDR", "localhost:6379"), "redis address")
+	flag.StringVar(&c.redisAddr, "redis-addr", env("SLUICE_REDIS_ADDR", "localhost:6379"), "redis host:port, or redis[s]://[user:pass@]host:port[/db] for auth, database and TLS")
 	flag.StringVar(&c.etcdEndpoints, "etcd-endpoints", env("SLUICE_ETCD_ENDPOINTS", "localhost:2379"), "comma-separated etcd endpoints")
+	flag.StringVar(&c.etcd.Username, "etcd-username", env("SLUICE_ETCD_USERNAME", ""), "etcd username")
+	flag.StringVar(&c.etcd.Password, "etcd-password", env("SLUICE_ETCD_PASSWORD", ""), "etcd password (prefer the env var)")
+	flag.StringVar(&c.etcd.CAFile, "etcd-ca-file", env("SLUICE_ETCD_CA_FILE", ""), "CA certificate that signs the etcd server certificate; enables TLS")
+	flag.StringVar(&c.etcd.CertFile, "etcd-cert-file", env("SLUICE_ETCD_CERT_FILE", ""), "client certificate for etcd mTLS")
+	flag.StringVar(&c.etcd.KeyFile, "etcd-key-file", env("SLUICE_ETCD_KEY_FILE", ""), "client key for etcd mTLS")
 	flag.StringVar(&c.otlpEndpoint, "otlp-endpoint", env("SLUICE_OTLP_ENDPOINT", "localhost:4318"), "OTLP HTTP trace endpoint")
 	flag.IntVar(&c.httpPort, "port", envInt("SLUICE_PORT", 8080), "http port (api role only)")
 	flag.IntVar(&c.metricsPort, "metrics-port", envInt("SLUICE_METRICS_PORT", 0), "prometheus metrics port (scheduler=9091, worker=9092 by default)")
@@ -96,7 +102,11 @@ func main() {
 	}
 	defer db.Close()
 
-	rdb := queue.NewClient(c.redisAddr)
+	rdb, err := queue.NewClient(c.redisAddr)
+	if err != nil {
+		slog.Error("configure redis", "err", err)
+		os.Exit(1)
+	}
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		slog.Error("connect to redis", "err", err)
 		os.Exit(1)
@@ -162,8 +172,8 @@ func runAPI(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queue, lim
 }
 
 func runScheduler(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queue) {
-	endpoints := strings.Split(c.etcdEndpoints, ",")
-	etcdClient, err := leader.NewClient(endpoints)
+	c.etcd.Endpoints = strings.Split(c.etcdEndpoints, ",")
+	etcdClient, err := leader.NewClient(c.etcd)
 	if err != nil {
 		slog.Error("connect to etcd", "err", err)
 		os.Exit(1)

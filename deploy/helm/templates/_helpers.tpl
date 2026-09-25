@@ -16,8 +16,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{ .Values.image.repository }}:{{ .Values.image.tag }}
 {{- end }}
 
+{{- define "sluice.secretName" -}}
+{{- .Values.existingSecret | default (printf "%s-secrets" (include "sluice.fullname" .)) }}
+{{- end }}
+
 {{- define "sluice.envFrom" -}}
 envFrom:
   - configMapRef:
       name: {{ include "sluice.fullname" . }}-config
+  - secretRef:
+      name: {{ include "sluice.secretName" . }}
 {{- end }}

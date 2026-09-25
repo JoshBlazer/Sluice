@@ -4,7 +4,5 @@ metadata:
   name: sluice-config
   namespace: sluice
 data:
-  SLUICE_POSTGRES_URL: "postgres://sluice:sluice@postgres:5432/sluice?sslmode=disable"
-  SLUICE_REDIS_ADDR: "redis:6379"
   SLUICE_ETCD_ENDPOINTS: "etcd:2379"
   SLUICE_PORT: "8080"

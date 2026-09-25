@@ -2,7 +2,10 @@ package leader
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"os"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -29,17 +32,64 @@ func New(client *clientv3.Client, prefix string, ttlSeconds int) *Election {
 	return &Election{client: client, prefix: prefix, ttl: ttlSeconds}
 }
 
-// NewClient creates an etcd v3 client. Endpoints should be passed as
-// a slice of "host:port" strings (e.g. []string{"localhost:2379"}).
-func NewClient(endpoints []string) (*clientv3.Client, error) {
+// ClientConfig describes how to reach etcd. Only Endpoints is required.
+type ClientConfig struct {
+	Endpoints []string // "host:port", or "https://host:port" with TLS
+	Username  string
+	Password  string
+	// TLS: CAFile verifies the server; CertFile and KeyFile (together) present a
+	// client certificate. Setting any of them enables TLS.
+	CAFile   string
+	CertFile string
+	KeyFile  string
+}
+
+// NewClient creates an etcd v3 client.
+func NewClient(cfg ClientConfig) (*clientv3.Client, error) {
+	tlsCfg, err := cfg.tlsConfig()
+	if err != nil {
+		return nil, err
+	}
 	c, err := clientv3.New(clientv3.Config{
-		Endpoints:   endpoints,
+		Endpoints:   cfg.Endpoints,
 		DialTimeout: 5 * time.Second,
+		Username:    cfg.Username,
+		Password:    cfg.Password,
+		TLS:         tlsCfg,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("etcd dial: %w", err)
 	}
 	return c, nil
+}
+
+func (cfg ClientConfig) tlsConfig() (*tls.Config, error) {
+	if cfg.CAFile == "" && cfg.CertFile == "" && cfg.KeyFile == "" {
+		return nil, nil
+	}
+	t := &tls.Config{MinVersion: tls.VersionTLS12}
+	if cfg.CAFile != "" {
+		pem, err := os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("read etcd CA file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("etcd CA file %s contains no PEM certificates", cfg.CAFile)
+		}
+		t.RootCAs = pool
+	}
+	if (cfg.CertFile == "") != (cfg.KeyFile == "") {
+		return nil, fmt.Errorf("etcd client certificate needs both a cert file and a key file")
+	}
+	if cfg.CertFile != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load etcd client certificate: %w", err)
+		}
+		t.Certificates = []tls.Certificate{cert}
+	}
+	return t, nil
 }
 
 // Campaign blocks until this node wins the election.

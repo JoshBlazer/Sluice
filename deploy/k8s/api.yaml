@@ -24,6 +24,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: sluice-config
+            - secretRef:
+                name: sluice-secrets
           readinessProbe:
             httpGet:
               path: /healthz
