@@ -33,8 +33,8 @@ const (
 	pendingReconcileMaxPerPass = 5000
 	deadWorkerInterval         = 5 * time.Second
 	partitionMaintainInterval  = 24 * time.Hour
-	duePollBatchSize           = 500
-	failedPollBatchSize        = 500
+	releaseBatchSize           = 1000
+	releaseMaxBatches          = 20 // up to 20,000 jobs per poll, every 100ms
 	cronBatchSize              = 200
 	pendingReconcileBatchSize  = 500
 	partitionLookaheadMonths   = 3
@@ -119,35 +119,36 @@ func (s *Scheduler) runDuePoll(ctx context.Context) {
 }
 
 func (s *Scheduler) pollScheduledJobs(ctx context.Context) {
-	jobs, err := storage.GetDueJobs(ctx, s.db, duePollBatchSize)
-	if err != nil {
-		slog.Error("poll scheduled jobs", "err", err)
-		return
-	}
-	for _, j := range jobs {
-		if err := storage.PromoteScheduledToPending(ctx, s.db, j.ID); err != nil {
-			slog.Error("promote scheduled job", "job_id", j.ID, "err", err)
-			continue
-		}
-		if err := s.queue.Enqueue(ctx, j.TenantID, j.ID, j.Priority); err != nil {
-			slog.Error("enqueue scheduled job", "job_id", j.ID, "err", err)
-		}
-	}
+	s.release(ctx, "scheduled", storage.PromoteDueScheduled)
 }
 
 func (s *Scheduler) pollFailedJobs(ctx context.Context) {
-	jobs, err := storage.GetFailedReadyJobs(ctx, s.db, failedPollBatchSize)
-	if err != nil {
-		slog.Error("poll failed ready jobs", "err", err)
-		return
-	}
-	for _, j := range jobs {
-		if err := storage.PromoteFailedToPending(ctx, s.db, j.ID); err != nil {
-			slog.Error("promote failed job", "job_id", j.ID, "err", err)
-			continue
+	s.release(ctx, "retrying", storage.PromoteReadyFailed)
+}
+
+// release moves due jobs to pending and enqueues them, a batch per statement and
+// round trip. It keeps going while batches come back full, so thousands of jobs
+// falling due at once (a cron fan-out, a campaign) go out in one poll rather than
+// a batch per tick, up to releaseMaxBatches so one poll can't starve the other.
+func (s *Scheduler) release(ctx context.Context, kind string, promote func(context.Context, *pgxpool.Pool, int) ([]storage.Released, error)) {
+	for range releaseMaxBatches {
+		jobs, err := promote(ctx, s.db, releaseBatchSize)
+		if err != nil {
+			slog.Error("release "+kind+" jobs", "err", err)
+			return
 		}
-		if err := s.queue.Enqueue(ctx, j.TenantID, j.ID, j.Priority); err != nil {
-			slog.Error("enqueue retried job", "job_id", j.ID, "err", err)
+		entries := make([]queue.Entry, len(jobs))
+		for i, j := range jobs {
+			entries[i] = queue.Entry{JobID: j.ID, TenantID: j.TenantID, Priority: j.Priority}
+		}
+		// If this fails the jobs stay pending in Postgres, and the pending
+		// reconciler enqueues them.
+		if err := s.queue.EnqueueMany(ctx, entries); err != nil {
+			slog.Error("enqueue released "+kind+" jobs", "count", len(entries), "err", err)
+			return
+		}
+		if len(jobs) < releaseBatchSize {
+			return
 		}
 	}
 }

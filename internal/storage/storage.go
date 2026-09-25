@@ -251,40 +251,65 @@ func FailJob(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID, runID uuid.
 	return nil
 }
 
-// GetDueJobs returns up to limit scheduled jobs whose run_at is in the past.
-func GetDueJobs(ctx context.Context, db *pgxpool.Pool, limit int) ([]*job.Job, error) {
-	rows, err := db.Query(ctx, `
-		SELECT id, tenant_id, type, payload, priority, state,
-		       run_at, claimed_at, claimed_by, claim_token, deadline,
-		       attempt, max_retries, backoff_seconds, idempotency_key,
-		       last_error, created_at, completed_at
-		FROM jobs
-		WHERE state = 'scheduled' AND run_at <= NOW()
-		ORDER BY priority, run_at
-		LIMIT $1`, limit)
-	if err != nil {
-		return nil, fmt.Errorf("get due jobs: %w", err)
-	}
-	defer rows.Close()
-	return collectJobs(rows)
+// Released is a job the scheduler moved to pending, with what enqueueing it needs.
+type Released struct {
+	ID       uuid.UUID
+	TenantID uuid.UUID
+	Priority int16
 }
 
-// GetFailedReadyJobs returns failed jobs whose run_at is now due for retry.
-func GetFailedReadyJobs(ctx context.Context, db *pgxpool.Pool, limit int) ([]*job.Job, error) {
-	rows, err := db.Query(ctx, `
-		SELECT id, tenant_id, type, payload, priority, state,
-		       run_at, claimed_at, claimed_by, claim_token, deadline,
-		       attempt, max_retries, backoff_seconds, idempotency_key,
-		       last_error, created_at, completed_at
-		FROM jobs
-		WHERE state = 'failed' AND run_at <= NOW()
-		ORDER BY priority, run_at
-		LIMIT $1`, limit)
+// PromoteDueScheduled moves up to limit scheduled jobs whose run_at has arrived
+// to pending in one statement and returns them, highest priority and oldest
+// first. SKIP LOCKED makes two schedulers that briefly both lead split the due
+// jobs between them rather than both promoting the same ones.
+func PromoteDueScheduled(ctx context.Context, db *pgxpool.Pool, limit int) ([]Released, error) {
+	return promote(ctx, db, "scheduled", `
+		WITH due AS (
+			SELECT id, run_at FROM jobs
+			WHERE state = 'scheduled' AND run_at <= NOW()
+			ORDER BY priority, run_at
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		), moved AS (
+			UPDATE jobs SET state = 'pending'
+			FROM due WHERE jobs.id = due.id
+			RETURNING jobs.id, jobs.tenant_id, jobs.priority, due.run_at AS due_at
+		)
+		SELECT id, tenant_id, priority FROM moved ORDER BY priority, due_at`, limit)
+}
+
+// PromoteReadyFailed is PromoteDueScheduled for failed jobs whose backoff has
+// elapsed. Their run_at becomes now, when the retry was released.
+func PromoteReadyFailed(ctx context.Context, db *pgxpool.Pool, limit int) ([]Released, error) {
+	return promote(ctx, db, "failed", `
+		WITH ready AS (
+			SELECT id, run_at FROM jobs
+			WHERE state = 'failed' AND run_at <= NOW()
+			ORDER BY priority, run_at
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		), moved AS (
+			UPDATE jobs SET state = 'pending', run_at = NOW()
+			FROM ready WHERE jobs.id = ready.id
+			RETURNING jobs.id, jobs.tenant_id, jobs.priority, ready.run_at AS due_at
+		)
+		SELECT id, tenant_id, priority FROM moved ORDER BY priority, due_at`, limit)
+}
+
+func promote(ctx context.Context, db *pgxpool.Pool, state, sql string, limit int) ([]Released, error) {
+	rows, err := db.Query(ctx, sql, limit)
 	if err != nil {
-		return nil, fmt.Errorf("get failed ready jobs: %w", err)
+		return nil, fmt.Errorf("promote %s jobs: %w", state, err)
 	}
-	defer rows.Close()
-	return collectJobs(rows)
+	released, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Released, error) {
+		var r Released
+		err := row.Scan(&r.ID, &r.TenantID, &r.Priority)
+		return r, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("promote %s jobs: %w", state, err)
+	}
+	return released, nil
 }
 
 // GetStaleClaims returns claimed/running jobs whose deadline has passed.
@@ -507,17 +532,6 @@ func GetPendingJobs(ctx context.Context, db *pgxpool.Pool, olderThan time.Durati
 	}
 	last := jobs[len(jobs)-1]
 	return jobs, PendingCursor{Priority: last.Priority, CreatedAt: last.CreatedAt, ID: last.ID}, nil
-}
-
-// PromoteScheduledToPending moves a scheduled job to pending when its run_at has arrived.
-func PromoteScheduledToPending(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID) error {
-	_, err := db.Exec(ctx, `
-		UPDATE jobs SET state = 'pending'
-		WHERE id = $1 AND state = 'scheduled'`, jobID)
-	if err != nil {
-		return fmt.Errorf("promote scheduled job %s: %w", jobID, err)
-	}
-	return nil
 }
 
 // PromoteFailedToPending moves a failed job back to pending when its backoff has elapsed.

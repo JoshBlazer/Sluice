@@ -133,6 +133,32 @@ func (q *Queue) Enqueue(ctx context.Context, tenantID uuid.UUID, jobID uuid.UUID
 	return nil
 }
 
+// Entry is a job for EnqueueMany.
+type Entry struct {
+	JobID    uuid.UUID
+	TenantID uuid.UUID
+	Priority int16
+}
+
+// EnqueueMany is Enqueue for many jobs in one round trip to Redis.
+func (q *Queue) EnqueueMany(ctx context.Context, entries []Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	pipe := q.rdb.Pipeline()
+	for _, e := range entries {
+		key := bucketForPriority(e.Priority) + ":" + e.TenantID.String()
+		// Eval rather than Run: Run's EVALSHA-then-EVAL fallback can't react
+		// to a NOSCRIPT error inside a pipeline.
+		enqueueScript.Eval(ctx, pipe, []string{key, enqueuedPrefix + e.JobID.String(), wakeKey},
+			e.JobID.String(), int(EnqueuedTTL.Seconds()))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("enqueue %d jobs: %w", len(entries), err)
+	}
+	return nil
+}
+
 const processingTTL = time.Hour
 
 // Dequeue pops the next job, blocking up to timeout for one to arrive. Priority lanes

@@ -207,3 +207,32 @@ func TestRequeue_PutsJobBackOnItsList(t *testing.T) {
 		t.Fatalf("after requeue popped %+v, want %+v (same job, same high-priority list)", again, item)
 	}
 }
+
+func TestEnqueueMany_IsIdempotentLikeEnqueue(t *testing.T) {
+	ctx := context.Background()
+	q := queue.New(testutil.Redis(t))
+	tenant := uuid.New()
+	entries := make([]queue.Entry, 250)
+	for i := range entries {
+		entries[i] = queue.Entry{JobID: uuid.New(), TenantID: tenant, Priority: []int16{job.PriorityHigh, job.PriorityNormal, job.PriorityLow}[i%3]}
+	}
+	for range 2 { // the second call must not add duplicates
+		if err := q.EnqueueMany(ctx, entries); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.Enqueue(ctx, tenant, entries[0].JobID, entries[0].Priority); err != nil {
+		t.Fatal(err)
+	}
+	depths, err := q.Depths(ctx, []uuid.UUID{tenant})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	for _, d := range depths {
+		total += d.Depth
+	}
+	if total != int64(len(entries)) {
+		t.Fatalf("queue holds %d entries for %d jobs", total, len(entries))
+	}
+}

@@ -105,7 +105,7 @@ The scheduler is the only stateful-by-position component. It has multiple replic
 
 The leader's responsibilities:
 
-1. **Due-job polling**: every 100ms, query Postgres for scheduled jobs whose `run_at` ≤ now and push them to Redis. Uses a `SELECT ... FOR UPDATE SKIP LOCKED` pattern to be safe even if a second leader briefly exists during failover.
+1. **Due-job polling**: every 100ms, move scheduled jobs whose `run_at` ≤ now (and failed jobs whose backoff is over) to pending and push them to Redis. Each batch of up to 1,000 is one `UPDATE` over a `SELECT ... FOR UPDATE SKIP LOCKED` plus one pipelined Redis round trip, and a poll keeps going while batches come back full (up to 20,000 jobs), so thousands of jobs due at the same moment are released at once. `SKIP LOCKED` keeps it safe even if a second leader briefly exists during failover: the two split the due jobs instead of both promoting them.
 
 2. **Cron expansion**: every minute, evaluate all active recurring schedules. For each schedule whose next-run-time has passed, create a new job row and either enqueue immediately or schedule for the future.
 
@@ -364,7 +364,7 @@ A noisy tenant can saturate their own concurrency limit, but their backlog doesn
 |---------|-----------|----------|
 | Worker process crash | Heartbeat expires (15s) | Job reassigned to another worker |
 | Worker network partition | Heartbeat expires | Job reassigned; original worker self-fences via claim token mismatch |
-| Scheduler leader crash | etcd lease expires (5s) | Standby promotes; due-job polling resumes |
+| Scheduler leader crash | etcd lease expires (2s) | Standby promotes; due-job polling resumes |
 | Postgres primary failure | Connection errors | API returns 503; producers retry; failover to replica when available |
 | Redis failure | Queue operations fail | API/workers gracefully degrade; scheduler can re-populate from Postgres |
 | etcd unavailable | Lease renewal fails | Current leader continues until lease expires; then no scheduling until etcd returns |

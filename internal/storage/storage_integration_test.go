@@ -333,3 +333,91 @@ func TestUpdateTenantLimits(t *testing.T) {
 		t.Fatalf("unknown tenant: err = %v, want ErrNotFound", err)
 	}
 }
+
+// Two schedulers that briefly both lead must split the due jobs between them:
+// every job is promoted exactly once.
+func TestPromoteDueScheduled_ConcurrentSchedulersSplitTheWork(t *testing.T) {
+	ctx := context.Background()
+	db := testutil.DB(t)
+	tn, _ := testutil.Tenant(t, db, 0, 100)
+	const n = 3000
+	if _, err := db.Exec(ctx, `
+		INSERT INTO jobs (id, tenant_id, type, payload, state, run_at)
+		SELECT gen_random_uuid(), $1, 'webhook', '{"url":"https://example.com"}', 'scheduled', NOW() - INTERVAL '1 second'
+		FROM generate_series(1, $2)`, tn.ID, n); err != nil {
+		t.Fatalf("insert scheduled jobs: %v", err)
+	}
+
+	var mu sync.Mutex
+	promoted := make(map[uuid.UUID]int, n)
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				got, err := storage.PromoteDueScheduled(ctx, db, 100)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if len(got) == 0 {
+					return
+				}
+				mu.Lock()
+				for _, r := range got {
+					if r.TenantID == tn.ID {
+						promoted[r.ID]++
+					}
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(promoted) != n {
+		t.Fatalf("%d distinct jobs promoted, want %d", len(promoted), n)
+	}
+	for id, times := range promoted {
+		if times != 1 {
+			t.Fatalf("job %s promoted %d times", id, times)
+		}
+	}
+}
+
+// Retries come back highest priority first, and only once their backoff is over.
+func TestPromoteReadyFailed_OnlyDueRetriesInPriorityOrder(t *testing.T) {
+	ctx := context.Background()
+	db := testutil.DB(t)
+	tn, _ := testutil.Tenant(t, db, 0, 100)
+	insert := func(priority int16, runAt time.Time) *job.Job {
+		return testutil.InsertJob(t, db, tn.ID, "https://example.com", func(j *job.Job) {
+			j.State, j.Priority, j.RunAt = job.StateFailed, priority, runAt
+		})
+	}
+	past := time.Now().Add(-time.Minute)
+	low := insert(job.PriorityLow, past)
+	high := insert(job.PriorityHigh, past)
+	notYet := insert(job.PriorityHigh, time.Now().Add(time.Hour))
+
+	got, err := storage.PromoteReadyFailed(ctx, db, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mine []uuid.UUID
+	for _, r := range got {
+		if r.TenantID == tn.ID {
+			mine = append(mine, r.ID)
+		}
+	}
+	if len(mine) != 2 || mine[0] != high.ID || mine[1] != low.ID {
+		t.Fatalf("promoted %v, want [%s %s] (high before low)", mine, high.ID, low.ID)
+	}
+	if j, _ := storage.GetJob(ctx, db, notYet.ID); j.State != job.StateFailed {
+		t.Fatalf("retry still in backoff is %s, want failed", j.State)
+	}
+	if j, _ := storage.GetJob(ctx, db, low.ID); j.State != job.StatePending || time.Since(j.RunAt) > time.Minute/2 {
+		t.Fatalf("released retry: state %s, run_at %v; want pending with run_at reset to now", j.State, j.RunAt)
+	}
+}
