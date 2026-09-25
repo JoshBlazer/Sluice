@@ -41,6 +41,7 @@ func New(db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter, port int)
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	r.Get("/readyz", s.handleReady)
 	r.Handle("/metrics", promhttp.Handler())
 	r.Get("/ws", s.handleWebSocket)
 

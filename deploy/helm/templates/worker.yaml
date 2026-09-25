@@ -24,7 +24,16 @@ spec:
           image: {{ include "sluice.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["--role", "worker", "--shutdown-timeout", {{ .Values.worker.shutdownTimeout | quote }}, "--concurrency", {{ .Values.worker.concurrency | quote }}]
+          ports:
+            - name: metrics
+              containerPort: 9092
           {{- include "sluice.envFrom" . | nindent 10 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 15
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
 ---

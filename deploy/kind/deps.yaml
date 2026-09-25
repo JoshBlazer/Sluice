@@ -1,0 +1,66 @@
+# Throwaway Postgres, Redis and etcd for trying the Helm chart on a local
+# cluster (kind, minikube, k3d). No persistence or HA: not for production.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: postgres}
+spec:
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - {name: POSTGRES_USER, value: sluice}
+            - {name: POSTGRES_PASSWORD, value: sluice}
+            - {name: POSTGRES_DB, value: sluice}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: [pg_isready, -U, sluice]}
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata: {name: postgres}
+spec: {selector: {app: postgres}, ports: [{port: 5432}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: redis}
+spec:
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata: {labels: {app: redis}}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: [--requirepass, sluice]
+          ports: [{containerPort: 6379}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redis}
+spec: {selector: {app: redis}, ports: [{port: 6379}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: etcd}
+spec:
+  selector: {matchLabels: {app: etcd}}
+  template:
+    metadata: {labels: {app: etcd}}
+    spec:
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.5.16
+          env:
+            - {name: ETCD_LISTEN_CLIENT_URLS, value: "http://0.0.0.0:2379"}
+            - {name: ETCD_ADVERTISE_CLIENT_URLS, value: "http://etcd:2379"}
+          ports: [{containerPort: 2379}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: etcd}
+spec: {selector: {app: etcd}, ports: [{port: 2379}]}

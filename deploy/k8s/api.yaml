@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: sluice:latest
+          image: ghcr.io/joshblazer/sluice:latest
           args: ["--role", "api"]
           ports:
             - containerPort: 8080

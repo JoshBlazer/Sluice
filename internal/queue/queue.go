@@ -85,6 +85,11 @@ end
 return 0
 `)
 
+// Ping checks that Redis is reachable.
+func (q *Queue) Ping(ctx context.Context) error {
+	return q.rdb.Ping(ctx).Err()
+}
+
 // Enqueue pushes a job to the tenant-scoped priority queue. It is a no-op if the
 // job is already waiting there.
 func (q *Queue) Enqueue(ctx context.Context, tenantID uuid.UUID, jobID uuid.UUID, priority int16) error {

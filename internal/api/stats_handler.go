@@ -77,6 +77,24 @@ func (s *Server) handleDeadLetter(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "count": len(entries)})
 }
 
+// handleReady reports whether this replica can serve traffic: liveness (/healthz)
+// only says the process is up, readiness also needs Postgres and Redis.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	checks := map[string]string{"postgres": "ok", "redis": "ok"}
+	status := http.StatusOK
+	if err := s.db.Ping(ctx); err != nil {
+		checks["postgres"] = err.Error()
+		status = http.StatusServiceUnavailable
+	}
+	if err := s.queue.Ping(ctx); err != nil {
+		checks["redis"] = err.Error()
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, checks)
+}
+
 func limitParam(r *http.Request) int {
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
