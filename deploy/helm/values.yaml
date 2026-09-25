@@ -24,6 +24,8 @@ api:
       memory: 256Mi
 
 scheduler:
+  # Days to keep finished jobs, run history and dead letters (0 keeps everything).
+  retentionDays: 30
   replicas: 3
   resources:
     requests:

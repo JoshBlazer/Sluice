@@ -35,6 +35,7 @@ type config struct {
 	shutdownTimeout time.Duration
 	webhookPrivate  bool
 	concurrency     int
+	retentionDays   int
 }
 
 func loadConfig() config {
@@ -48,6 +49,7 @@ func loadConfig() config {
 	flag.IntVar(&c.metricsPort, "metrics-port", envInt("SLUICE_METRICS_PORT", 0), "prometheus metrics port (scheduler=9091, worker=9092 by default)")
 	flag.DurationVar(&c.shutdownTimeout, "shutdown-timeout", 30*time.Second, "graceful shutdown timeout")
 	flag.IntVar(&c.concurrency, "concurrency", envInt("SLUICE_WORKER_CONCURRENCY", worker.DefaultConcurrency), "jobs a worker runs at once (worker role only)")
+	flag.IntVar(&c.retentionDays, "retention-days", envInt("SLUICE_RETENTION_DAYS", 30), "days to keep finished jobs, run history and dead letters; 0 keeps everything (scheduler role only)")
 	flag.BoolVar(&c.webhookPrivate, "webhook-allow-private", env("SLUICE_WEBHOOK_ALLOW_PRIVATE", "") == "true", "let webhook jobs call loopback/private addresses (local dev only)")
 	flag.Parse()
 	return c
@@ -59,6 +61,10 @@ func main() {
 	})))
 
 	c := loadConfig()
+	if c.retentionDays < 0 {
+		fmt.Fprintln(os.Stderr, "--retention-days must be 0 (keep everything) or positive")
+		os.Exit(1)
+	}
 	if c.concurrency < 1 {
 		fmt.Fprintln(os.Stderr, "--concurrency must be at least 1")
 		os.Exit(1)
@@ -172,6 +178,7 @@ func runScheduler(ctx context.Context, c config, db *pgxpool.Pool, q *queue.Queu
 
 	elect := leader.New(etcdClient, "/sluice/scheduler/leader", leader.DefaultTTLSeconds)
 	s := scheduler.New(db, q)
+	s.Retention = time.Duration(c.retentionDays) * 24 * time.Hour
 	s.Run(ctx, elect)
 }
 

@@ -33,6 +33,8 @@ const (
 	partitionLookaheadMonths  = 3
 	deadLetterBatchSize       = 500
 	queueDepthInterval        = 5 * time.Second
+	retentionInterval         = time.Hour
+	retentionBatchSize        = 1000
 )
 
 var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
@@ -40,6 +42,10 @@ var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month 
 type Scheduler struct {
 	db    *pgxpool.Pool
 	queue *queue.Queue
+
+	// Retention is how long finished jobs, their run history and dead-letter
+	// entries are kept. Zero keeps everything.
+	Retention time.Duration
 }
 
 func New(db *pgxpool.Pool, q *queue.Queue) *Scheduler {
@@ -79,6 +85,7 @@ func (s *Scheduler) lead(ctx context.Context) {
 		s.runPendingReconciler,
 		s.runPartitionMaintainer,
 		s.runQueueDepthExporter,
+		s.runRetention,
 	} {
 		wg.Add(1)
 		go func(f func(context.Context)) {
@@ -234,6 +241,61 @@ func (s *Scheduler) exportQueueDepths(ctx context.Context) {
 	metrics.QueueDepth.Reset()
 	for _, d := range depths {
 		metrics.QueueDepth.WithLabelValues(d.Priority, d.TenantID.String()).Set(float64(d.Depth))
+	}
+}
+
+func (s *Scheduler) runRetention(ctx context.Context) {
+	if s.Retention <= 0 {
+		return
+	}
+	s.enforceRetention(ctx)
+	ticker := time.NewTicker(retentionInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.enforceRetention(ctx)
+		}
+	}
+}
+
+// enforceRetention deletes history older than Retention in small batches, so a
+// large backlog never holds long locks or one huge transaction.
+func (s *Scheduler) enforceRetention(ctx context.Context) {
+	cutoff := time.Now().Add(-s.Retention)
+
+	for _, prune := range []struct {
+		what string
+		fn   func(context.Context, *pgxpool.Pool, time.Time, int) (int64, error)
+	}{
+		{"finished jobs", storage.PruneFinishedJobs},
+		{"dead-letter entries", storage.PruneDeadLetter},
+	} {
+		var total int64
+		for ctx.Err() == nil {
+			n, err := prune.fn(ctx, s.db, cutoff, retentionBatchSize)
+			if err != nil {
+				slog.Error("retention: prune "+prune.what, "err", err)
+				break
+			}
+			total += n
+			if n < retentionBatchSize {
+				break
+			}
+		}
+		if total > 0 {
+			slog.Info("retention: pruned "+prune.what, "count", total, "older_than", cutoff)
+		}
+	}
+
+	dropped, err := storage.DropJobRunsPartitionsBefore(ctx, s.db, cutoff)
+	if err != nil {
+		slog.Error("retention: drop job_runs partitions", "err", err)
+	}
+	if len(dropped) > 0 {
+		slog.Info("retention: dropped job_runs partitions", "partitions", dropped)
 	}
 }
 
