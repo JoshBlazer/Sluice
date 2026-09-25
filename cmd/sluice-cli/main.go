@@ -236,7 +236,7 @@ func cmdRotateWebhookSecret(ctx context.Context, db *pgxpool.Pool, args []string
 		fatalf("rotate webhook secret: %v", err)
 	}
 	fmt.Printf("new webhook secret: %s\n\n"+
-		"Workers sign with it within a minute (or immediately after SIGHUP). Have your\n"+
+		"Workers sign with it within 5 seconds (or immediately after SIGHUP). Have your\n"+
 		"receivers accept both the old and new secret until then.\n", secret)
 }
 

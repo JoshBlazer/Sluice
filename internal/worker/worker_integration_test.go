@@ -293,3 +293,30 @@ func TestWorker_SignsWithTenantSecret(t *testing.T) {
 		t.Fatalf("webhook-id = %q, want job ID %s", d.id, j.ID)
 	}
 }
+
+// A tenant created after the worker started must not wait long for its jobs:
+// workers only dequeue for tenants they know about.
+func TestWorker_PicksUpNewTenantQuickly(t *testing.T) {
+	ctx := context.Background()
+	db := testutil.DB(t)
+	q := queue.New(testutil.Redis(t))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+
+	w, cancel := startWorker(t, db, q)
+	defer func() { cancel(); w.Shutdown(5 * time.Second) }()
+	time.Sleep(500 * time.Millisecond) // worker has loaded its tenant list
+
+	tn, _ := testutil.Tenant(t, db, 0, 100)
+	j := testutil.InsertJob(t, db, tn.ID, srv.URL, nil)
+	q.Enqueue(ctx, tn.ID, j.ID, j.Priority)
+
+	start := time.Now()
+	testutil.Eventually(t, 15*time.Second, "new tenant's job succeeded", func() bool {
+		return jobState(t, ctx, db, j) == job.StateSucceeded
+	})
+	if took := time.Since(start); took > 8*time.Second {
+		t.Fatalf("new tenant's job took %v to run, want well under 10s", took)
+	}
+}
