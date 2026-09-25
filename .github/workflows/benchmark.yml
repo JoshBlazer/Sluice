@@ -83,7 +83,8 @@ jobs:
         run: |
           mkdir -p logs
           ./bin/sluice-cli create-tenant -rate-limit 0 bench | awk '/api key/{print $3}' > bench.key
-          SLUICE_POSTGRES_URL="$DSN&pool_max_conns=64" nohup ./bin/sluice --role api > logs/api.log 2>&1 &
+          # Pools must fit Postgres max_connections (100): API 40 + workers (concurrency+4 each) + scheduler.
+          SLUICE_POSTGRES_URL="$DSN&pool_max_conns=40" nohup ./bin/sluice --role api > logs/api.log 2>&1 &
           SLUICE_POSTGRES_URL="$DSN" nohup ./bin/sluice --role scheduler > logs/scheduler.log 2>&1 &
           for i in $(seq 1 "$WORKERS"); do
             SLUICE_POSTGRES_URL="$DSN" SLUICE_WEBHOOK_ALLOW_PRIVATE=true \

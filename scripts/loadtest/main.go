@@ -51,6 +51,7 @@ func main() {
 		accepted = make(map[int]time.Time, *n) // job seq → submit acknowledged
 		e2e      = make([]time.Duration, 0, *n)
 		received atomic.Int64
+		dupes    atomic.Int64
 		seen     sync.Map
 	)
 
@@ -66,7 +67,8 @@ func main() {
 			return
 		}
 		if _, dup := seen.LoadOrStore(seq, true); dup {
-			return // at-least-once: count each job once
+			dupes.Add(1) // at-least-once: count each job once, but report re-runs
+			return
 		}
 		mu.Lock()
 		if t, ok := accepted[seq]; ok {
@@ -149,6 +151,7 @@ func main() {
 	fmt.Printf("jobs executed:         %d/%d in %v\n", received.Load(), ok, totalElapsed.Round(time.Millisecond))
 	fmt.Printf("execution throughput:  %.0f jobs/sec\n", float64(received.Load())/totalElapsed.Seconds())
 	fmt.Printf("submit→execute:        p50 %v  p99 %v\n", pct(lat, 50), pct(lat, 99))
+	fmt.Printf("duplicate deliveries:  %d\n", dupes.Load())
 	if received.Load() < ok {
 		os.Exit(1)
 	}

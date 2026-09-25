@@ -94,12 +94,36 @@ const processingTTL = time.Hour
 // proportionally larger share of worker time. Returns uuid.Nil with no error if
 // nothing arrives before timeout.
 func (q *Queue) Dequeue(ctx context.Context, workerID string, tenants []TenantWeight, timeout time.Duration) (uuid.UUID, error) {
+	item, err := q.Pop(ctx, workerID, tenants, timeout)
+	return item.JobID, err
+}
+
+// Item is a popped job and the list it came from, so it can be put back.
+type Item struct {
+	JobID uuid.UUID
+	List  string
+}
+
+// Requeue puts a popped job back at the end of the line in the list it came from, e.g. when
+// the worker couldn't claim it because Postgres was unavailable. Like Enqueue it
+// is a no-op if the job is already waiting.
+func (q *Queue) Requeue(ctx context.Context, item Item) error {
+	err := enqueueScript.Run(ctx, q.rdb, []string{item.List, enqueuedPrefix + item.JobID.String()},
+		item.JobID.String(), int(EnqueuedTTL.Seconds())).Err()
+	if err != nil {
+		return fmt.Errorf("requeue job %s to %s: %w", item.JobID, item.List, err)
+	}
+	return nil
+}
+
+// Pop is Dequeue, also reporting which list the job came from.
+func (q *Queue) Pop(ctx context.Context, workerID string, tenants []TenantWeight, timeout time.Duration) (Item, error) {
 	if len(tenants) == 0 {
 		select {
 		case <-ctx.Done():
-			return uuid.Nil, ctx.Err()
+			return Item{}, ctx.Err()
 		case <-time.After(timeout):
-			return uuid.Nil, nil
+			return Item{}, nil
 		}
 	}
 
@@ -113,19 +137,19 @@ func (q *Queue) Dequeue(ctx context.Context, workerID string, tenants []TenantWe
 
 	// BLMPOP takes from the first non-empty key in order and wakes as soon as any
 	// key receives a job, so pickup latency is a round trip, not a poll interval.
-	_, vals, err := q.rdb.BLMPop(ctx, timeout, "right", 1, keys...).Result()
+	list, vals, err := q.rdb.BLMPop(ctx, timeout, "right", 1, keys...).Result()
 	if err == redis.Nil {
-		return uuid.Nil, nil
+		return Item{}, nil
 	}
 	if err != nil {
 		if ctx.Err() != nil {
-			return uuid.Nil, ctx.Err()
+			return Item{}, ctx.Err()
 		}
-		return uuid.Nil, fmt.Errorf("dequeue: %w", err)
+		return Item{}, fmt.Errorf("dequeue: %w", err)
 	}
 	id, err := uuid.Parse(vals[0])
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("malformed job id %q in queue: %w", vals[0], err)
+		return Item{}, fmt.Errorf("malformed job id %q in queue: %w", vals[0], err)
 	}
 
 	// Clearing the marker lets the job be enqueued again (e.g. after a failed claim or
@@ -141,7 +165,7 @@ func (q *Queue) Dequeue(ctx context.Context, workerID string, tenants []TenantWe
 	if _, err := pipe.Exec(ctx); err != nil {
 		slog.Warn("record processing list", "worker_id", workerID, "job_id", id, "err", err)
 	}
-	return id, nil
+	return Item{JobID: id, List: list}, nil
 }
 
 // Depth is the number of jobs waiting in one tenant's priority lane.

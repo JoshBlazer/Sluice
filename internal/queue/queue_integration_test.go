@@ -186,3 +186,24 @@ func TestEnqueue_IdempotentWhileWaiting(t *testing.T) {
 		t.Fatalf("re-enqueued job not dequeued: got %s", got)
 	}
 }
+
+func TestRequeue_PutsJobBackOnItsList(t *testing.T) {
+	ctx := context.Background()
+	q := queue.New(testutil.Redis(t))
+	tn := uuid.New()
+	tenants := []queue.TenantWeight{{ID: tn, Weight: 1}}
+	id := uuid.New()
+	q.Enqueue(ctx, tn, id, job.PriorityHigh)
+
+	item, err := q.Pop(ctx, "w1", tenants, time.Second)
+	if err != nil || item.JobID != id {
+		t.Fatalf("pop = %+v, %v", item, err)
+	}
+	if err := q.Requeue(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	again, err := q.Pop(ctx, "w1", tenants, time.Second)
+	if err != nil || again != item {
+		t.Fatalf("after requeue popped %+v, want %+v (same job, same high-priority list)", again, item)
+	}
+}
