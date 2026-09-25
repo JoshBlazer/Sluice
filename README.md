@@ -14,13 +14,16 @@ Sluice is a from-scratch alternative to Sidekiq, Celery, or AWS SQS + EventBridg
 
 Most teams reach for either a Redis-only queue (fast but loses jobs on crash) or a full workflow engine like Temporal (powerful but heavy). Sluice occupies the middle: Postgres as the durable source of truth, Redis as the hot path, and a clean separation between scheduling and execution.
 
-- **Durable by default** — jobs survive crashes, network partitions, and worker death
-- **High throughput** — designed for 10k+ jobs/sec on commodity hardware
-- **At-least-once delivery** — with idempotency keys to deduplicate retries
-- **Scheduler HA** — leader election via etcd, with hot standbys
-- **Multi-tenant** — per-tenant rate limits and weighted fair queuing
+- **Redis is just a cache** — the API answers only after the job is committed to Postgres. Flush or lose Redis entirely and the scheduler rebuilds the queues from Postgres within about 90 seconds; no job is lost
+- **Durable by default** — jobs survive crashes, network partitions, and worker death. A crashed worker's job is picked up again within 20 seconds
+- **At-least-once delivery, without double-writes** — a stalled worker that wakes up after its job was reassigned can't overwrite the new result, and idempotency keys deduplicate submissions
+- **Scheduler HA** — leader election via etcd with hot standbys. Failover takes ~50ms on shutdown and ~2s after a crash, and two leaders overlapping briefly can't double-run anything
+- **Multi-tenant and secure** — per-tenant rate limits, weighted fair queuing, isolated data, hashed API keys, and webhooks that refuse to call internal addresses
+- **High throughput** — designed for 10k+ jobs/sec; workers run many jobs concurrently
 - **Observable** — Prometheus metrics, OpenTelemetry traces, structured logs on every code path
-- **Operable** — graceful shutdown, hot config reload, admin CLI for incident response
+- **Operable** — graceful shutdown that finishes in-flight jobs, hot config reload, admin CLI for incident response
+
+The durability, failover, isolation and security behaviour above is covered by tests that CI runs on every push, with the race detector on, against real Postgres, Redis and etcd. Throughput is a design target; see [Performance](#performance-targets).
 
 ---
 
@@ -115,7 +118,7 @@ flowchart LR
     Worker2 -->|update status| PG
     WorkerN -->|update status| PG
 
-    Worker1 -->|execute| Target[User Code /<br/>Webhook]
+    Worker1 -->|HTTP call| Target[Webhook<br/>endpoint]
 
     Dashboard[Dashboard] -->|query| API
 
@@ -130,28 +133,39 @@ Full design and trade-offs are documented in [architecture.md](architecture.md).
 
 ## Features
 
-### Job Types
+### Jobs
 
-| Type | Use Case | Example |
-|------|----------|---------|
+Jobs are **webhooks**: an HTTP request (`GET`, `POST`, `PUT`, `PATCH` or `DELETE`) with optional headers and body. Any status below 400 counts as success. Each job runs on one of three timings:
+
+| Timing | Use Case | Example |
+|--------|----------|---------|
 | Immediate | Run as soon as a worker is available | Webhook on order placed |
-| Scheduled | Run at a specific future time | Send reminder at 9am tomorrow |
-| Recurring | Run on a cron schedule | Nightly database cleanup |
+| Scheduled (`run_at`) | Run at a specific future time | Send reminder at 9am tomorrow |
+| Recurring (`/v1/schedules`) | Run on a cron schedule, in the schedule's timezone | Nightly database cleanup |
 
 ### Reliability
 
-- **At-least-once delivery** with visibility timeouts for crashed workers
-- **Idempotency keys** — duplicate submissions return the original job
+- **Postgres is the source of truth** — Redis only holds queue order. Anything lost from Redis is rebuilt from Postgres
+- **At-least-once delivery** — heartbeats extend each job's claim; if a worker dies, its job is reclaimed within 20 seconds
+- **Stale workers can't clobber results** — every claim carries a token, and a worker whose job was reassigned has its result discarded
+- **Safe under split brain** — jobs are claimed with `SELECT … FOR UPDATE SKIP LOCKED`, and every scheduler task is safe to run twice, so a brief dual leader can't double-run a job
+- **Idempotency keys** — duplicate submissions return the original job, and cron occurrences can't fire twice
 - **Exponential backoff with jitter** — configurable per job
-- **Dead-letter queue** — jobs exhausting retries are quarantined for inspection
-- **Worker heartbeats** — abandoned jobs return to the queue automatically
+- **Dead-letter queue** — jobs exhausting retries are quarantined for inspection and one-click replay
 
 ### Multi-Tenancy
 
 - Per-tenant API keys
-- Per-tenant rate limits (jobs/sec)
-- Weighted fair queuing across tenants within each priority lane
+- Per-tenant rate limits (token bucket, jobs/sec)
+- Strict priority lanes across tenants (any tenant's urgent job runs before everything normal), with weighted fair queuing between tenants inside each lane
+- Every API, stats and dashboard view is scoped to the caller's tenant
 - Per-tenant metrics
+
+### Security
+
+- **SSRF protection** — webhooks refuse loopback, private, link-local (e.g. cloud metadata at `169.254.169.254`) and other non-public addresses. The check runs on the resolved IP when connecting, so it also blocks redirects and DNS rebinding
+- **Hashed API keys** — only SHA-256 digests are stored; `sluice-cli` issues and rotates keys
+- **Validated input** — job payloads, priorities, retry limits, cron templates and request sizes are checked at the API boundary
 
 ### Observability
 
@@ -162,7 +176,8 @@ Full design and trade-offs are documented in [architecture.md](architecture.md).
 
 ### Operations
 
-- **Graceful shutdown**: workers drain in-flight jobs before exiting (configurable timeout)
+- **Concurrent workers**: each worker process runs many jobs at once (`--concurrency`, default 10), sizing its database pool to match
+- **Graceful shutdown**: workers drain in-flight jobs before exiting; any still running at the timeout are aborted and recorded as failed attempts
 - **Hot config reload**: SIGHUP makes workers reload tenant weights immediately (they also refresh every 60s); rate-limit changes apply on the next request
 - **Admin CLI**: create tenants, rotate keys, replay dead-letter jobs, drain queues, force-fail stuck jobs, dump scheduler state
 - **Backup-friendly**: Postgres is the source of truth; standard backup tooling applies
@@ -171,17 +186,18 @@ Full design and trade-offs are documented in [architecture.md](architecture.md).
 
 ## Performance Targets
 
-Design targets on a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, Redis 7:
+Design targets are for a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, Redis 7. Measurements so far come from CI and a single 4-core laptop running everything under Docker Desktop, a much smaller setup:
 
-| Metric | Target |
-|--------|--------|
-| Submission throughput | 10,000+ jobs/sec |
-| End-to-end latency (p50) | < 10 ms (submit → pickup) |
-| End-to-end latency (p99) | < 50 ms (submit → pickup) |
-| Scheduler failover | < 2 seconds (leader → hot standby); measured ~50ms on shutdown, 1.5–2.1s after a crash (lease expiry) |
-| Recovery from full node loss | < 30 seconds (all in-flight jobs) |
+| Metric | Target | Measured |
+|--------|--------|----------|
+| Submission throughput | 10,000+ jobs/sec | Not yet benchmarked on target hardware |
+| Latency p50 (submit → execute) | < 10 ms | 14.5 ms on the laptop |
+| Latency p99 (submit → execute) | < 50 ms | ~95 ms on the laptop |
+| Scheduler failover | < 2 seconds | ~50 ms on shutdown; 1.5–2.1 s after a crash (checked in CI) |
+| Worker crash recovery | — | < 20 seconds (checked in CI) |
+| Recovery from full node loss | < 30 seconds | Not yet measured |
 
-These are design targets, not measured results. `scripts/loadtest` measures submission throughput and submit→execute latency against a running stack; see [Load testing](#load-testing).
+`scripts/loadtest` reproduces the throughput and latency measurements against any running stack; see [Load testing](#load-testing).
 
 ---
 
