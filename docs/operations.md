@@ -77,4 +77,6 @@ The Next.js dashboard in `web/` shows live queue depth, recent runs, per-job att
 cd web && npm install && npm run dev -- --port 3000
 ```
 
-Set `NEXT_PUBLIC_API_URL` if the API isn't at `http://localhost:8080`.
+Set `NEXT_PUBLIC_API_URL` if the API isn't at `http://localhost:8080`. If the browser can reach only the dashboard, as in GitHub Codespaces, set `SLUICE_API_PROXY=http://localhost:8080` and `NEXT_PUBLIC_API_URL=/sluice-api`. The dashboard then serves the API, including the live WebSocket, from its own origin.
+
+To see the dashboard with something happening, `go run ./scripts/demo -key dev-token` submits a steady mix of jobs: some succeed, some fail and retry, a few end in the dead letter, and occasional bursts build a backlog. It also adds a once-a-minute cron schedule. The worker needs `SLUICE_WEBHOOK_ALLOW_PRIVATE=true`, because the demo serves the webhooks itself.

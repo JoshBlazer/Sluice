@@ -8,6 +8,27 @@
 
 Sluice is a from-scratch alternative to Sidekiq, Celery, or AWS SQS + EventBridge for teams that want the durability of a relational store, the throughput of an in-memory queue, and the operational simplicity of a single Go binary per role.
 
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/JoshBlazer/Sluice?quickstart=1)
+
+Try it without installing anything: the Codespace builds and starts the whole stack with demo traffic, then opens the dashboard. Creating one takes a few minutes; after that it resumes in seconds.
+
+![The Sluice dashboard: a worker comes back to a backlog of 800 jobs and drains high priority first, then normal, then low](docs/images/queue-drain.gif)
+
+<sub>A worker comes back to a backlog of about 800 jobs and drains the high-priority lane first, then normal, then low (2.5× speed).</sub>
+
+<details>
+<summary>More screenshots</summary>
+
+**Retry history:** every attempt of a job, with its error and timing. This one failed three times and moved to the dead letter.
+
+![Retries page with one job's attempt timeline expanded](docs/images/retries.png)
+
+**Dead letter:** jobs that exhausted their retries, each one replayable.
+
+![Dead-letter page](docs/images/dead-letter.png)
+
+</details>
+
 ---
 
 ## Why Sluice?
@@ -29,7 +50,7 @@ The durability, failover, isolation and security behaviour above is covered by t
 
 ## Quick Start
 
-Needs Go 1.26+, Docker, and the `migrate` CLI (`make bootstrap` installs it).
+Needs Go 1.26+, Docker, and the `migrate` CLI (`make bootstrap` installs it). Or skip all of this with the [Codespace](https://codespaces.new/JoshBlazer/Sluice?quickstart=1).
 
 ```bash
 git clone https://github.com/JoshBlazer/Sluice && cd Sluice
@@ -186,6 +207,8 @@ sluice/
 ├── web/                     # Next.js dashboard
 ├── scripts/
 │   ├── loadtest/            # Load generator for the performance numbers
+│   ├── bench/               # Multi-machine benchmark (docs/benchmarking.md)
+│   ├── demo/                # Demo traffic for the dashboard
 │   ├── chaos.sh             # Failure-mode tests
 │   └── k8s-smoke.sh         # Helm install + job on kind
 ├── deploy/
@@ -194,7 +217,8 @@ sluice/
 │   ├── k8s/                 # Plain manifests
 │   ├── kind/                # Test dependencies for the kind smoke test
 │   └── monitoring/          # Grafana dashboard, alert-rule tests
-├── docs/                    # Reference documentation
+├── .devcontainer/           # GitHub Codespaces demo environment
+├── docs/                    # Reference documentation and screenshots
 └── architecture.md          # Design doc
 ```
 

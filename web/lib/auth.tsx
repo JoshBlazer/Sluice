@@ -1,6 +1,6 @@
 "use client";
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
-import { API_BASE } from "./config";
+import { API_BASE, DEMO_API_KEY } from "./config";
 
 // The dashboard never has an API key built in: each viewer signs in with their
 // tenant's key. It is kept in sessionStorage, so it lasts for the browser tab and
@@ -67,7 +67,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
 }
 
 function SignIn({ onSignedIn }: { onSignedIn: (token: string) => void }) {
-  const [key, setKey] = useState("");
+  const [key, setKey] = useState(DEMO_API_KEY);
   const [error, setError] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
 
@@ -97,7 +97,9 @@ function SignIn({ onSignedIn }: { onSignedIn: (token: string) => void }) {
       <form onSubmit={submit} className="w-full max-w-sm space-y-4 rounded-xl border border-zinc-700/60 bg-zinc-900/60 p-6">
         <div>
           <h1 className="text-xl font-bold text-white">Sign in to Sluice</h1>
-          <p className="text-sm text-zinc-500 mt-1">Paste a tenant API key. You'll see that tenant's jobs.</p>
+          <p className="text-sm text-zinc-500 mt-1">
+            {DEMO_API_KEY ? "Demo environment: the local dev tenant's key is filled in." : "Paste a tenant API key. You'll see that tenant's jobs."}
+          </p>
         </div>
         <input
           type="password"
