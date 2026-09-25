@@ -9,6 +9,13 @@ import (
 	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
+// DefaultTTLSeconds is the leader lease TTL. It bounds failover after a leader
+// crashes (a clean shutdown resigns immediately). 2s is about etcd's minimum
+// lease with default settings. A short lease can briefly yield two leaders after
+// a long pause, which every scheduler loop tolerates (conditional updates,
+// idempotent enqueue, cron idempotency keys).
+const DefaultTTLSeconds = 2
+
 // Election manages etcd-based leader election for the scheduler.
 // Only one scheduler instance runs the active loops at a time; all others
 // are hot standbys that block on Campaign until the leader vacates.

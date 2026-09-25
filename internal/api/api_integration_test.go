@@ -287,9 +287,9 @@ func TestRetryHistory(t *testing.T) {
 	// Two failed attempts, each promoted back to pending for the next one.
 	for i := 0; i < 2; i++ {
 		token := uuid.New()
-		ok, runID, err := storage.TryClaim(ctx, db, retried.ID, "w", token, time.Now().Add(time.Minute))
-		if err != nil || !ok {
-			t.Fatalf("claim %d: ok=%v err=%v", i, ok, err)
+		claimed, runID, err := storage.TryClaim(ctx, db, retried.ID, "w", token, time.Now().Add(time.Minute))
+		if err != nil || claimed == nil {
+			t.Fatalf("claim %d: claimed=%v err=%v", i, claimed != nil, err)
 		}
 		next := time.Now()
 		if err := storage.FailJob(ctx, db, retried.ID, runID, token, fmt.Sprintf("boom %d", i), &next); err != nil {

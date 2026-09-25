@@ -22,11 +22,12 @@ type Server struct {
 	db      *pgxpool.Pool
 	queue   *queue.Queue
 	limiter *ratelimit.Limiter
+	tenants *tenantCache
 	server  *http.Server
 }
 
 func New(db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter, port int) *Server {
-	s := &Server{db: db, queue: q, limiter: limiter}
+	s := &Server{db: db, queue: q, limiter: limiter, tenants: newTenantCache(db)}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -44,7 +45,7 @@ func New(db *pgxpool.Pool, q *queue.Queue, limiter *ratelimit.Limiter, port int)
 	r.Get("/ws", s.handleWebSocket)
 
 	r.Route("/v1", func(r chi.Router) {
-		r.Use(authMiddleware(db))
+		r.Use(authMiddleware(s.tenants))
 
 		r.Post("/jobs", s.handleSubmitJob)
 		r.Get("/jobs", s.handleListJobs)

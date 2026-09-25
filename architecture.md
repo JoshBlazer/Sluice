@@ -101,7 +101,7 @@ The API is fully stateless. Any replica can handle any request. Scaling is horiz
 
 ### Scheduler Service
 
-The scheduler is the only stateful-by-position component. It has multiple replicas, but exactly one is the active leader at any moment, elected via an etcd lease with a 5-second TTL and 1.5-second renewal interval.
+The scheduler is the only stateful-by-position component. It has multiple replicas, but exactly one is the active leader at any moment, elected via an etcd lease with a 2-second TTL (about etcd's minimum), renewed every ~0.7 seconds.
 
 The leader's responsibilities:
 
@@ -113,7 +113,7 @@ The leader's responsibilities:
 
 4. **Dead-letter promotion**: jobs that exceed their max_retries get moved from active tables to the `dead_letter` table for inspection.
 
-Non-leader replicas are hot standbys. They keep their database connection pool warm and run periodic health checks against Postgres and Redis. On lease loss by the current leader, the next standby promotes typically within 1.5 seconds.
+Non-leader replicas are hot standbys. They keep their database connection pool warm and run periodic health checks against Postgres and Redis. A leader that shuts down resigns, and a standby takes over in about 50ms. A leader that crashes keeps its lease until it expires, so takeover takes 1.5–2.1 seconds (measured by `internal/leader` integration tests). A short lease can briefly produce two leaders after a long pause; every scheduler loop tolerates that (conditional updates, idempotent enqueue, cron idempotency keys).
 
 ### Worker Service
 
@@ -266,8 +266,7 @@ stateDiagram-v2
     [*] --> scheduled: submit (with run_at)
     
     scheduled --> pending: run_at reached
-    pending --> claimed: worker BRPOPLPUSH
-    claimed --> running: worker starts execution
+    pending --> running: worker claims (one statement, FOR UPDATE SKIP LOCKED)
     
     running --> succeeded: success
     running --> failed: error
@@ -322,7 +321,7 @@ Sluice does **not** guarantee FIFO ordering within a queue. Workers pull concurr
 
 ### Leader Election
 
-Scheduler replicas race to acquire a 5-second TTL etcd lease at the key `/sluice/scheduler/leader`. The winner becomes leader. The leader renews the lease every 1.5 seconds. On loss of lease (process death, network partition, GC pause > 5s), another standby takes over.
+Scheduler replicas race to acquire a 2-second TTL etcd lease at the key `/sluice/scheduler/leader`. The winner becomes leader and renews the lease about every 0.7 seconds. On loss of lease (process death, network partition, GC pause > ~2s), another standby takes over.
 
 We chose etcd over alternatives because:
 

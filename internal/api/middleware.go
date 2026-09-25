@@ -10,7 +10,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sluice/internal/metrics"
 	"github.com/sluice/internal/storage"
 	"github.com/sluice/internal/telemetry"
@@ -19,7 +18,7 @@ import (
 
 // authMiddleware reads Authorization: Bearer <api_key>, looks up the tenant,
 // and injects it into the request context. Rejects with 401 if missing or invalid.
-func authMiddleware(db *pgxpool.Pool) func(http.Handler) http.Handler {
+func authMiddleware(tenants *tenantCache) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			key := extractBearerToken(r)
@@ -27,7 +26,7 @@ func authMiddleware(db *pgxpool.Pool) func(http.Handler) http.Handler {
 				writeError(w, http.StatusUnauthorized, "missing api key")
 				return
 			}
-			t, err := storage.GetTenantByAPIKey(r.Context(), db, key)
+			t, err := tenants.lookup(r.Context(), key)
 			if err != nil {
 				if err != storage.ErrNotFound {
 					slog.Error("tenant lookup", "err", err)

@@ -19,9 +19,9 @@ import (
 func failOnce(t *testing.T, ctx context.Context, db *pgxpool.Pool, j *job.Job) job.State {
 	t.Helper()
 	token := uuid.New()
-	ok, runID, err := storage.TryClaim(ctx, db, j.ID, "w", token, time.Now().Add(time.Minute))
-	if err != nil || !ok {
-		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	claimed, runID, err := storage.TryClaim(ctx, db, j.ID, "w", token, time.Now().Add(time.Minute))
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: claimed=%v err=%v", claimed != nil, err)
 	}
 	cur, err := storage.GetJob(ctx, db, j.ID)
 	if err != nil {
@@ -81,16 +81,16 @@ func TestCompleteJob_StaleTokenIsDiscarded(t *testing.T) {
 	tn, _ := testutil.Tenant(t, db, 0, 100)
 	j := testutil.InsertJob(t, db, tn.ID, "https://example.com", nil)
 
-	ok, runID, err := storage.TryClaim(ctx, db, j.ID, "w", uuid.New(), time.Now().Add(time.Minute))
-	if err != nil || !ok {
-		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	claimed, runID, err := storage.TryClaim(ctx, db, j.ID, "w", uuid.New(), time.Now().Add(time.Minute))
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: claimed=%v err=%v", claimed != nil, err)
 	}
 	if err := storage.CompleteJob(ctx, db, j.ID, runID, uuid.New()); err != nil {
 		t.Fatalf("complete with stale token should be a silent no-op, got %v", err)
 	}
 	got, _ := storage.GetJob(ctx, db, j.ID)
-	if got.State != job.StateClaimed {
-		t.Fatalf("state = %s, want claimed (stale completion must not apply)", got.State)
+	if got.State != job.StateRunning {
+		t.Fatalf("state = %s, want running (stale completion must not apply)", got.State)
 	}
 }
 
@@ -101,9 +101,9 @@ func TestCompleteJob_RecordsSubSecondDuration(t *testing.T) {
 	j := testutil.InsertJob(t, db, tn.ID, "https://example.com", nil)
 
 	token := uuid.New()
-	ok, runID, err := storage.TryClaim(ctx, db, j.ID, "w", token, time.Now().Add(time.Minute))
-	if err != nil || !ok {
-		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	claimed, runID, err := storage.TryClaim(ctx, db, j.ID, "w", token, time.Now().Add(time.Minute))
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: claimed=%v err=%v", claimed != nil, err)
 	}
 	time.Sleep(250 * time.Millisecond)
 	if err := storage.CompleteJob(ctx, db, j.ID, runID, token); err != nil {
@@ -125,9 +125,9 @@ func TestRequeueStaleJob(t *testing.T) {
 	j := testutil.InsertJob(t, db, tn.ID, "https://example.com", func(j *job.Job) { j.MaxRetries = 1 })
 
 	claimExpired := func() {
-		ok, _, err := storage.TryClaim(ctx, db, j.ID, "w", uuid.New(), time.Now().Add(-time.Second))
-		if err != nil || !ok {
-			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		claimed, _, err := storage.TryClaim(ctx, db, j.ID, "w", uuid.New(), time.Now().Add(-time.Second))
+		if err != nil || claimed == nil {
+			t.Fatalf("claim: claimed=%v err=%v", claimed != nil, err)
 		}
 	}
 
@@ -218,7 +218,7 @@ func TestCancelJob(t *testing.T) {
 	if got.State != job.StateCancelled {
 		t.Fatalf("state = %s, want cancelled", got.State)
 	}
-	if ok, _, _ := storage.TryClaim(ctx, db, j.ID, "w", uuid.New(), time.Now().Add(time.Minute)); ok {
+	if claimed, _, _ := storage.TryClaim(ctx, db, j.ID, "w", uuid.New(), time.Now().Add(time.Minute)); claimed != nil {
 		t.Fatal("a cancelled job must not be claimable")
 	}
 	if err := storage.CancelJob(ctx, db, j.ID, tn.ID); !errors.Is(err, storage.ErrNotFound) {

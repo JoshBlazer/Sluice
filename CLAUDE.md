@@ -120,7 +120,7 @@ Start only when Phase 1 is complete.
 
 Start only when Phase 2 is complete.
 
-1. **etcd leader election** — add etcd to `docker-compose.yml`. Scheduler acquires a 5-second TTL lease at `/sluice/scheduler/leader`. Renews every 1.5 seconds. Non-leaders are hot standbys: keep DB connection warm, do nothing else.
+1. **etcd leader election** — add etcd to `docker-compose.yml`. Scheduler acquires a lease at `/sluice/scheduler/leader` (2-second TTL since 2026-09-25: the original 5s missed the <2s crash-failover target; see leader.DefaultTTLSeconds). Non-leaders are hot standbys: keep DB connection warm, do nothing else.
 2. **Split-brain safety** — `GetDueJobs` already uses `SKIP LOCKED`. Verify this holds under dual-leader conditions with a test.
 3. **Hot config reload** — `SIGHUP` reloads tenant configs and rate limits without restart.
 4. **Weighted fair queuing** — within a priority lane, workers iterate tenants in proportion to their weight. Default weight 100.
