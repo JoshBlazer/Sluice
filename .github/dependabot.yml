@@ -1,19 +1,36 @@
-# Weekly dependency update PRs; security updates arrive as soon as advisories do.
+# Weekly dependency updates. Patch and minor updates arrive grouped, one PR per
+# ecosystem; each major update gets its own PR (the title shows the version
+# jump), so breaking changes are reviewed deliberately. Security updates arrive
+# as soon as advisories do.
 version: 2
 updates:
   - package-ecosystem: gomod
     directory: /
     schedule: {interval: weekly}
+    labels: [dependencies, go]
     groups:
-      go-deps: {patterns: ["*"]}
+      go-minor-patch: {update-types: [minor, patch]}
+
   - package-ecosystem: npm
     directory: /web
     schedule: {interval: weekly}
+    labels: [dependencies, dashboard]
     groups:
-      web-deps: {patterns: ["*"], update-types: [minor, patch]}
+      web-minor-patch: {update-types: [minor, patch]}
+    ignore:
+      # Node type definitions follow the Node LTS line CI runs on (24), not the
+      # newest Node release; bump them together with node-version in ci.yml.
+      - dependency-name: "@types/node"
+        update-types: [version-update:semver-major]
+
   - package-ecosystem: github-actions
     directory: /
     schedule: {interval: weekly}
+    labels: [dependencies, ci]
+    groups:
+      actions-minor-patch: {update-types: [minor, patch]}
+
   - package-ecosystem: docker
     directory: /
     schedule: {interval: weekly}
+    labels: [dependencies, docker]

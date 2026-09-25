@@ -302,7 +302,7 @@ sluice/
 - Go 1.26+
 - Docker + Docker Compose
 - `migrate` CLI: `go install -tags 'pgx5' github.com/golang-migrate/migrate/v4/cmd/migrate@latest`
-- Node 20+ (for the dashboard)
+- Node 24 LTS (for the dashboard)
 
 ### Local Setup
 
