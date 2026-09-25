@@ -173,6 +173,29 @@ paths:
         "200": {description: The schedule, content: {application/json: {schema: {$ref: "#/components/schemas/Schedule"}}}}
         "401": {$ref: "#/components/responses/Unauthorized"}
         "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      summary: Pause, resume or edit a schedule
+      description: |
+        Changing `cron` or `timezone`, or resuming a paused schedule, recomputes the
+        next run from now, so resuming doesn't fire a burst of missed occurrences.
+      operationId: updateSchedule
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: {type: boolean}
+                cron: {type: string}
+                timezone: {type: string}
+                job_template: {$ref: "#/components/schemas/JobTemplate"}
+      responses:
+        "200": {description: The updated schedule, content: {application/json: {schema: {$ref: "#/components/schemas/Schedule"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
     delete:
       summary: Delete a schedule
       operationId: deleteSchedule
@@ -226,6 +249,114 @@ paths:
                   count: {type: integer}
         "401": {$ref: "#/components/responses/Unauthorized"}
 
+  /admin/v1/tenants:
+    post:
+      summary: Create a tenant (admin)
+      description: Returns the new tenant's API key once; only its hash is stored.
+      operationId: adminCreateTenant
+      security: [{adminToken: []}]
+      tags: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - type: object
+                  required: [name]
+                  properties:
+                    name: {type: string}
+                - $ref: "#/components/schemas/TenantLimits"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant: {$ref: "#/components/schemas/Tenant"}
+                  api_key: {type: string}
+                  webhook_secret: {type: string}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/AdminDisabled"}
+    get:
+      summary: List all tenants (admin)
+      operationId: adminListTenants
+      security: [{adminToken: []}]
+      tags: [admin]
+      responses:
+        "200":
+          description: Tenants
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenants: {type: array, items: {$ref: "#/components/schemas/Tenant"}}
+                  count: {type: integer}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/AdminDisabled"}
+
+  /admin/v1/tenants/{id}:
+    get:
+      summary: Get a tenant (admin)
+      operationId: adminGetTenant
+      security: [{adminToken: []}]
+      tags: [admin]
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: The tenant, content: {application/json: {schema: {$ref: "#/components/schemas/Tenant"}}}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      summary: Change a tenant's limits or status (admin)
+      description: "A disabled tenant's API key stops working and its jobs stop being dequeued; nothing is deleted. Changes apply within seconds."
+      operationId: adminUpdateTenant
+      security: [{adminToken: []}]
+      tags: [admin]
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/TenantLimits"
+                - type: object
+                  properties:
+                    status: {type: string, enum: [active, disabled]}
+      responses:
+        "200": {description: The updated tenant, content: {application/json: {schema: {$ref: "#/components/schemas/Tenant"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{id}/rotate-key:
+    post:
+      summary: Issue a new API key, revoking the old one (admin)
+      operationId: adminRotateKey
+      security: [{adminToken: []}]
+      tags: [admin]
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: New key, content: {application/json: {schema: {type: object, properties: {api_key: {type: string}}}}}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{id}/rotate-webhook-secret:
+    post:
+      summary: Issue a new webhook signing secret (admin)
+      operationId: adminRotateWebhookSecret
+      security: [{adminToken: []}]
+      tags: [admin]
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: New secret, content: {application/json: {schema: {type: object, properties: {webhook_secret: {type: string}}}}}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
   /ws:
     get:
       summary: Live stats over WebSocket
@@ -276,7 +407,11 @@ components:
     apiKey:
       type: http
       scheme: bearer
-      description: A tenant API key (sk_...), issued by `sluice-cli create-tenant`
+      description: A tenant API key (sk_...), issued by `sluice-cli create-tenant` or the admin API
+    adminToken:
+      type: http
+      scheme: bearer
+      description: The operator token set with SLUICE_ADMIN_TOKEN. Without it the admin API answers 404
 
   parameters:
     ID:
@@ -290,6 +425,7 @@ components:
     Unauthorized: {description: Missing or invalid API key, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
     NotFound: {description: "Not found, or belongs to another tenant", content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
     Conflict: {description: Duplicate, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+    AdminDisabled: {description: "The admin API is not enabled (no SLUICE_ADMIN_TOKEN)", content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
 
   schemas:
     Error:
@@ -403,6 +539,23 @@ components:
           type: object
           additionalProperties: {type: integer}
         timestamp: {type: string, format: date-time}
+
+    TenantLimits:
+      type: object
+      properties:
+        rate_limit: {type: integer, minimum: 0, description: "Job submissions per second; 0 = unlimited"}
+        weight: {type: integer, minimum: 1, description: Fair-queuing weight relative to other tenants}
+        max_concurrency: {type: integer, minimum: 0, description: "Jobs running at once; 0 = unlimited"}
+
+    Tenant:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        status: {type: string, enum: [active, disabled]}
+        rate_limit: {type: integer}
+        weight: {type: integer}
+        max_concurrency: {type: integer}
 
     Readiness:
       type: object

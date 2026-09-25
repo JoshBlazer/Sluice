@@ -145,7 +145,7 @@ Jobs are **webhooks**: an HTTP request (`GET`, `POST`, `PUT`, `PATCH` or `DELETE
 |--------|----------|---------|
 | Immediate | Run as soon as a worker is available | Webhook on order placed |
 | Scheduled (`run_at`) | Run at a specific future time | Send reminder at 9am tomorrow |
-| Recurring (`/v1/schedules`) | Run on a cron schedule, in the schedule's timezone | Nightly database cleanup |
+| Recurring (`/v1/schedules`) | Run on a cron schedule, in the schedule's timezone. `PATCH` pauses (`"enabled": false`), resumes or edits it; resuming skips occurrences missed while paused | Nightly database cleanup |
 
 ### Reliability
 
@@ -470,6 +470,15 @@ sluice-cli rotate-webhook-secret <tenant-id>
 
 # Change limits (API replicas and workers pick changes up within seconds)
 sluice-cli set-tenant-limits -max-concurrency 20 -rate-limit 500 <tenant-id>
+```
+
+### Admin API
+
+Setting `SLUICE_ADMIN_TOKEN` (at least 32 characters) on the API enables `/admin/v1`, the same tenant management over HTTP: create, list, get, change limits, disable or re-enable, rotate API keys and webhook secrets. It authenticates with `Authorization: Bearer <admin token>`, which tenant keys can never satisfy. Without the token the admin routes answer 404. See the [OpenAPI spec](internal/api/openapi.yaml) for the endpoints.
+
+```bash
+curl -X POST http://localhost:8080/admin/v1/tenants -H "Authorization: Bearer $SLUICE_ADMIN_TOKEN"   -d '{"name": "acme", "rate_limit": 200, "max_concurrency": 50}'
+curl -X PATCH http://localhost:8080/admin/v1/tenants/<id> -H "Authorization: Bearer $SLUICE_ADMIN_TOKEN"   -d '{"status": "disabled"}'   # key stops working within 10s; nothing is deleted
 ```
 
 ---

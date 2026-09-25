@@ -343,3 +343,102 @@ func TestWebhookSecretEndpoint(t *testing.T) {
 		t.Fatalf("unauthenticated: %d, want 401", code)
 	}
 }
+
+func TestUpdateSchedule(t *testing.T) {
+	e := newEnv(t)
+	_, key := testutil.Tenant(t, testutil.DB(t), 0, 100)
+	_, otherKey := testutil.Tenant(t, testutil.DB(t), 0, 100)
+	_, created := e.do("POST", "/v1/schedules", key, map[string]any{
+		"name": "report", "cron": "0 9 * * *", "timezone": "UTC", "job_template": webhookJob(),
+	})
+	id := created["id"].(string)
+	path := "/v1/schedules/" + id
+
+	if code, body := e.do("PATCH", path, key, map[string]any{"enabled": false}); code != http.StatusOK || body["enabled"] != false {
+		t.Fatalf("pause: %d %v", code, body)
+	}
+	code, body := e.do("PATCH", path, key, map[string]any{"cron": "30 17 * * *", "timezone": "Asia/Tokyo"})
+	if code != http.StatusOK {
+		t.Fatalf("edit: %d %v", code, body)
+	}
+	next, _ := time.Parse(time.RFC3339Nano, body["next_run_at"].(string))
+	tokyo, _ := time.LoadLocation("Asia/Tokyo")
+	if n := next.In(tokyo); n.Hour() != 17 || n.Minute() != 30 {
+		t.Fatalf("next_run_at = %v in Tokyo, want 17:30", n)
+	}
+	if code, body := e.do("PATCH", path, key, map[string]any{"enabled": true}); code != http.StatusOK || body["enabled"] != true {
+		t.Fatalf("resume: %d %v", code, body)
+	}
+	if code, _ := e.do("PATCH", path, key, map[string]any{"cron": "not a cron"}); code != http.StatusBadRequest {
+		t.Fatalf("bad cron: %d, want 400", code)
+	}
+	if code, _ := e.do("PATCH", path, key, map[string]any{"job_template": map[string]any{"type": "webhook"}}); code != http.StatusBadRequest {
+		t.Fatalf("bad template: %d, want 400", code)
+	}
+	if code, _ := e.do("PATCH", path, otherKey, map[string]any{"enabled": false}); code != http.StatusNotFound {
+		t.Fatalf("other tenant: %d, want 404", code)
+	}
+}
+
+func TestAdminAPI(t *testing.T) {
+	db := testutil.DB(t)
+	rdb := testutil.Redis(t)
+	q := queue.New(rdb)
+	s := api.New(db, q, ratelimit.New(rdb), 0)
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	e := &env{t: t, srv: srv, q: q}
+
+	if code, _ := e.do("GET", "/admin/v1/tenants", "anything", nil); code != http.StatusNotFound {
+		t.Fatalf("admin API before EnableAdmin: %d, want 404", code)
+	}
+	if err := s.EnableAdmin("short"); err == nil {
+		t.Fatal("a short admin token must be rejected")
+	}
+	admin := "admin-" + uuid.NewString() + uuid.NewString()
+	if err := s.EnableAdmin(admin); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := e.do("GET", "/admin/v1/tenants", "wrong-token", nil); code != http.StatusUnauthorized {
+		t.Fatalf("wrong admin token: %d, want 401", code)
+	}
+	_, tenantKey := testutil.Tenant(t, db, 0, 100)
+	if code, _ := e.do("GET", "/admin/v1/tenants", tenantKey, nil); code != http.StatusUnauthorized {
+		t.Fatalf("a tenant key on the admin API: %d, want 401", code)
+	}
+
+	code, created := e.do("POST", "/admin/v1/tenants", admin, map[string]any{"name": "acme-" + uuid.NewString(), "max_concurrency": 5})
+	if code != http.StatusCreated {
+		t.Fatalf("create: %d %v", code, created)
+	}
+	tn := created["tenant"].(map[string]any)
+	id := tn["id"].(string)
+	t.Cleanup(func() { db.Exec(context.Background(), `DELETE FROM tenants WHERE id = $1`, id) })
+	if tn["max_concurrency"].(float64) != 5 || tn["status"] != "active" {
+		t.Fatalf("created tenant = %v", tn)
+	}
+
+	code, updated := e.do("PATCH", "/admin/v1/tenants/"+id, admin, map[string]any{"rate_limit": 50, "status": "disabled"})
+	if code != http.StatusOK || updated["rate_limit"].(float64) != 50 || updated["status"] != "disabled" {
+		t.Fatalf("update: %d %v", code, updated)
+	}
+	if code, _ := e.do("GET", "/v1/jobs", created["api_key"].(string), nil); code != http.StatusUnauthorized {
+		t.Fatalf("disabled tenant's key: %d, want 401", code)
+	}
+	e.do("PATCH", "/admin/v1/tenants/"+id, admin, map[string]any{"status": "active"})
+
+	_, rotated := e.do("POST", "/admin/v1/tenants/"+id+"/rotate-key", admin, nil)
+	if code, _ := e.do("GET", "/v1/jobs", rotated["api_key"].(string), nil); code != http.StatusOK {
+		t.Fatalf("rotated key: %d, want 200", code)
+	}
+	_, secret := e.do("POST", "/admin/v1/tenants/"+id+"/rotate-webhook-secret", admin, nil)
+	if !strings.HasPrefix(secret["webhook_secret"].(string), "whsec_") {
+		t.Fatalf("rotated secret = %v", secret)
+	}
+	if code, _ := e.do("PATCH", "/admin/v1/tenants/"+uuid.NewString(), admin, map[string]any{"weight": 10}); code != http.StatusNotFound {
+		t.Fatalf("unknown tenant: %d, want 404", code)
+	}
+	if code, _ := e.do("PATCH", "/admin/v1/tenants/"+id, admin, map[string]any{"weight": 0}); code != http.StatusBadRequest {
+		t.Fatalf("zero weight: %d, want 400", code)
+	}
+}
