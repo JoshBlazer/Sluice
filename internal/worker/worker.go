@@ -112,6 +112,28 @@ func (w *Worker) Run(ctx context.Context) {
 
 	w.loadTenants(pollCtx)
 
+	// Liveness, kept up until Run returns (including while draining), so the
+	// scheduler knows the jobs this worker has popped are still being handled.
+	aliveCtx, stopAlive := context.WithCancel(context.Background())
+	defer stopAlive()
+	if err := w.queue.MarkAlive(aliveCtx, w.id); err != nil {
+		slog.Warn("mark worker alive", "err", err)
+	}
+	go func() {
+		ticker := time.NewTicker(queue.WorkerAliveTTL / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-aliveCtx.Done():
+				return
+			case <-ticker.C:
+				if err := w.queue.MarkAlive(aliveCtx, w.id); err != nil {
+					slog.Warn("mark worker alive", "err", err)
+				}
+			}
+		}
+	}()
+
 	// Background goroutine refreshes the tenant list periodically and on demand.
 	go func() {
 		ticker := time.NewTicker(tenantRefresh)
