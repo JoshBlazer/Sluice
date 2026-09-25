@@ -22,8 +22,10 @@ import (
 const (
 	dequeueTimeout    = time.Second
 	heartbeatInterval = 5 * time.Second
-	tenantRefresh     = 60 * time.Second
-	recordTimeout     = 10 * time.Second
+	// Workers only dequeue for tenants they know about, so this bounds how long a
+	// newly created tenant's first jobs wait. The query is one small table scan.
+	tenantRefresh = 5 * time.Second
+	recordTimeout = 10 * time.Second
 )
 
 const DefaultConcurrency = 10

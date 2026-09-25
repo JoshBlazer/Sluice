@@ -179,7 +179,7 @@ const wh = new Webhook(process.env.SLUICE_WEBHOOK_SECRET);
 const payload = wh.verify(rawBody, request.headers);
 ```
 
-`webhook-id` is the job ID and stays the same across retries, so receivers can use it to deduplicate at-least-once deliveries. `sluice-cli rotate-webhook-secret <tenant-id>` issues a new secret; workers switch to it within a minute (or immediately after SIGHUP), so accept both secrets briefly while rotating.
+`webhook-id` is the job ID and stays the same across retries, so receivers can use it to deduplicate at-least-once deliveries. `sluice-cli rotate-webhook-secret <tenant-id>` issues a new secret; workers switch to it within 5 seconds (or immediately after SIGHUP), so accept both secrets briefly while rotating.
 - **Validated input** — job payloads, priorities, retry limits, cron templates and request sizes are checked at the API boundary
 
 ### Observability
@@ -193,7 +193,7 @@ const payload = wh.verify(rawBody, request.headers);
 
 - **Concurrent workers**: each worker process runs many jobs at once (`--concurrency`, default 10), sizing its database pool to match
 - **Graceful shutdown**: workers drain in-flight jobs before exiting; any still running at the timeout are aborted and recorded as failed attempts
-- **Hot config reload**: SIGHUP makes workers reload tenant weights immediately (they also refresh every 60s); rate-limit changes apply on the next request
+- **Hot config reload**: SIGHUP makes workers reload tenant weights immediately (they also refresh every 5s, so new tenants are served within seconds); rate-limit changes apply on the next request
 - **Admin CLI**: create tenants, rotate keys, replay dead-letter jobs, drain queues, force-fail stuck jobs, dump scheduler state
 - **Bounded storage**: finished jobs, run history and dead letters are pruned after a configurable retention period (default 30 days), in small batches
 - **Backup-friendly**: Postgres is the source of truth; standard backup tooling applies

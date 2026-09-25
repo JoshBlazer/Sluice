@@ -669,7 +669,7 @@ func NewWebhookSecret() (string, error) {
 }
 
 // RotateWebhookSecret replaces a tenant's webhook signing secret and returns it.
-// Workers pick it up on their next tenant refresh (within a minute, or on SIGHUP).
+// Workers pick it up on their next tenant refresh (within 5 seconds, or on SIGHUP).
 func RotateWebhookSecret(ctx context.Context, db *pgxpool.Pool, tenantID uuid.UUID) (string, error) {
 	secret, err := NewWebhookSecret()
 	if err != nil {
