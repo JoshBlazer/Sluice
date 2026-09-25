@@ -29,6 +29,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: sluice-config
+            - secretRef:
+                name: sluice-secrets
           resources:
             requests:
               cpu: 50m

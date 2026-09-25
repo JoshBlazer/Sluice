@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -53,8 +54,18 @@ func New(rdb *redis.Client) *Queue {
 	return &Queue{rdb: rdb}
 }
 
-func NewClient(addr string) *redis.Client {
-	return redis.NewClient(&redis.Options{Addr: addr})
+// NewClient connects to Redis. addr is either host:port or a URL carrying
+// credentials, database and TLS: redis://[user:pass@]host:port[/db], or
+// rediss://... for TLS, as managed Redis services issue them.
+func NewClient(addr string) (*redis.Client, error) {
+	if !strings.Contains(addr, "://") {
+		return redis.NewClient(&redis.Options{Addr: addr}), nil
+	}
+	opts, err := redis.ParseURL(addr)
+	if err != nil {
+		return nil, fmt.Errorf("parse redis url: %w", err)
+	}
+	return redis.NewClient(opts), nil
 }
 
 // EnqueuedTTL bounds how long a job's "already queued" marker lives. It is the

@@ -6,8 +6,9 @@ metadata:
   labels:
     {{- include "sluice.labels" . | nindent 4 }}
 data:
-  SLUICE_POSTGRES_URL: {{ .Values.postgres.url | quote }}
-  SLUICE_REDIS_ADDR: {{ .Values.redis.addr | quote }}
   SLUICE_ETCD_ENDPOINTS: {{ .Values.etcd.endpoints | quote }}
+  {{- with .Values.etcd.username }}
+  SLUICE_ETCD_USERNAME: {{ . | quote }}
+  {{- end }}
   SLUICE_PORT: {{ .Values.api.port | quote }}
   SLUICE_RETENTION_DAYS: {{ .Values.scheduler.retentionDays | quote }}

@@ -3,14 +3,27 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+# Credentials go into a Secret. To manage it yourself, create a Secret with keys
+# SLUICE_POSTGRES_URL, SLUICE_REDIS_ADDR (and SLUICE_ETCD_PASSWORD if used) and
+# name it here; postgres.url, redis.addr and etcd.password are then ignored.
+existingSecret: ""
+
 postgres:
   url: "postgres://sluice:sluice@postgres:5432/sluice?sslmode=disable"
 
 redis:
+  # host:port, or redis[s]://[user:pass@]host:port[/db] for auth, database and TLS.
   addr: "redis:6379"
 
 etcd:
   endpoints: "etcd:2379"
+  username: ""
+  password: ""
+  tls:
+    # Name of a Secret holding ca.crt (and tls.crt/tls.key when clientCert is
+    # true), mounted into scheduler pods to connect to etcd over TLS.
+    secretName: ""
+    clientCert: false
 
 api:
   replicas: 2

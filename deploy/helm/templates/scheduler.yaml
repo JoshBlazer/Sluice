@@ -29,5 +29,26 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["--role", "scheduler"]
           {{- include "sluice.envFrom" . | nindent 10 }}
+          {{- with .Values.etcd.tls.secretName }}
+          env:
+            - name: SLUICE_ETCD_CA_FILE
+              value: /etc/sluice/etcd-tls/ca.crt
+            {{- if $.Values.etcd.tls.clientCert }}
+            - name: SLUICE_ETCD_CERT_FILE
+              value: /etc/sluice/etcd-tls/tls.crt
+            - name: SLUICE_ETCD_KEY_FILE
+              value: /etc/sluice/etcd-tls/tls.key
+            {{- end }}
+          volumeMounts:
+            - name: etcd-tls
+              mountPath: /etc/sluice/etcd-tls
+              readOnly: true
+          {{- end }}
           resources:
             {{- toYaml .Values.scheduler.resources | nindent 12 }}
+      {{- with .Values.etcd.tls.secretName }}
+      volumes:
+        - name: etcd-tls
+          secret:
+            secretName: {{ . }}
+      {{- end }}
