@@ -297,6 +297,6 @@ Dev notes:
 - etcd runs on port 2379 (quay.io/coreos/etcd:v3.5.16), single-node for local dev
 - Queue keys are now per-tenant: queue:{priority}:{tenantID} — flush Redis when switching from Phase 2 data
 - Integration tests: make test-integration (needs Docker stack + migrations; uses Redis DB 15 and throwaway tenants)
-- Race detector on Windows: run the tests in a golang:1.26 container pointed at host.docker.internal (SLUICE_TEST_POSTGRES_URL / SLUICE_TEST_REDIS_ADDR)
+- Race detector on Windows: run the tests in a golang:1.27 container pointed at host.docker.internal (SLUICE_TEST_POSTGRES_URL / SLUICE_TEST_REDIS_ADDR)
 - Load test: scripts/loadtest (see README "Load testing")
 - SIGHUP reloads tenant weights in worker: kill -SIGHUP <worker-pid> or Send-Signal on Windows
