@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { API_TOKEN, type StatsResponse } from "./api";
+import type { StatsResponse } from "./api";
+import { getToken } from "./auth";
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8080/ws";
 
@@ -15,7 +16,7 @@ export function useLiveStats() {
     function connect() {
       // Browsers can't send an Authorization header on a WebSocket handshake,
       // so the API key goes in the query string.
-      const sock = new WebSocket(`${WS_URL}?token=${encodeURIComponent(API_TOKEN)}`);
+      const sock = new WebSocket(`${WS_URL}?token=${encodeURIComponent(getToken() ?? "")}`);
       ws.current = sock;
 
       sock.onopen = () => setConnected(true);

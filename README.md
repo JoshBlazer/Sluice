@@ -17,7 +17,7 @@ Most teams reach for either a Redis-only queue (fast but loses jobs on crash) or
 - **Redis is just a cache** — the API answers only after the job is committed to Postgres. Flush or lose Redis entirely and the scheduler rebuilds the queues from Postgres within about 90 seconds; no job is lost
 - **Durable by default** — jobs survive crashes, network partitions, and worker death. A crashed worker's job is picked up again within 20 seconds
 - **At-least-once delivery, without double-writes** — a stalled worker that wakes up after its job was reassigned can't overwrite the new result, and idempotency keys deduplicate submissions
-- **Scheduler HA** — leader election via etcd with hot standbys. Failover takes ~50ms on shutdown and ~2s after a crash, and two leaders overlapping briefly can't double-run anything
+- **Scheduler HA** — leader election via etcd with hot standbys. Failover takes ~50ms on shutdown and ~2s (up to ~2.6s) after a crash, and two leaders overlapping briefly can't double-run anything
 - **Multi-tenant and secure** — per-tenant rate limits, weighted fair queuing, isolated data, hashed API keys, signed webhooks ([Standard Webhooks](https://www.standardwebhooks.com/)), and webhooks that refuse to call internal addresses
 - **High throughput** — designed for 10k+ jobs/sec; workers run many jobs concurrently
 - **Observable** — Prometheus metrics, OpenTelemetry traces, structured logs on every code path
@@ -40,7 +40,11 @@ make dev-api
 make dev-scheduler
 SLUICE_WEBHOOK_ALLOW_PRIVATE=true make dev-worker
 
-# Submit a job (dev-token is the seeded local tenant)
+# Enable the local-only "dev" tenant (API key: dev-token). Migrations disable it
+# on every database, so it never works anywhere you haven't run this.
+go run ./cmd/sluice-cli enable-dev-tenant
+
+# Submit a job
 curl -X POST http://localhost:8080/v1/jobs \
   -H "Authorization: Bearer dev-token" \
   -H "Content-Type: application/json" \
@@ -76,7 +80,7 @@ curl -X POST http://localhost:8080/v1/schedules \
     }
   }'
 
-# Start the dashboard
+# Start the dashboard, then sign in with an API key (dev-token locally)
 cd web && npm install && npm run dev -- --port 3000
 # open http://localhost:3000
 ```
@@ -94,7 +98,7 @@ go run ./cmd/sluice-cli create-tenant -rate-limit 200 -weight 100 acme
 go run ./cmd/sluice-cli rotate-key <tenant-id>   # revokes the old key (API replicas cache keys for up to 10s)
 ```
 
-`dev-token` is seeded by the migrations for local use only. Before any real deployment, disable it: `UPDATE tenants SET status = 'disabled' WHERE name = 'dev';`
+The `dev` tenant, with the public API key `dev-token`, exists only for local development. Migrations keep it disabled, and only `sluice-cli enable-dev-tenant` turns it on. Never run that against a shared or production database.
 
 ---
 
@@ -187,7 +191,7 @@ const payload = wh.verify(rawBody, request.headers);
 - **Metrics**: queue depth, processing latency histogram, retry counts, worker health, throughput per tenant
 - **Tracing**: distributed traces from API submission to job completion via OpenTelemetry + Jaeger
 - **Logs**: structured JSON via `log/slog` with correlation IDs threaded through context
-- **Dashboard**: real-time queue depth, recent runs, retry histories (per-job attempt timelines), dead-letter inspection, scoped to the API key it runs with
+- **Dashboard**: real-time queue depth, recent runs, retry histories (per-job attempt timelines), dead-letter inspection. Viewers sign in with a tenant API key and see only that tenant. No key is built into the dashboard, and a signed-in key is kept only for the browser tab
 
 ### Operations
 
@@ -210,7 +214,7 @@ Design targets are for a 3-node cluster (4 vCPU / 8 GB RAM each), Postgres 16, R
 | Execution throughput | — | 1,686 jobs/sec (20,000 jobs in 11.9 s, 0 duplicate executions) |
 | Latency p50 (submit → execute) | < 10 ms | 0.65 ms |
 | Latency p99 (submit → execute) | < 50 ms | 2.9 ms |
-| Scheduler failover | < 2 seconds | ~50 ms on shutdown; 1.5–2.1 s after a crash (checked in CI) |
+| Scheduler failover | < 2 seconds | ~50 ms on shutdown; 1.5–2.6 s after a crash, bounded by etcd lease expiry (checked in CI) |
 | Worker crash recovery | — | < 20 seconds (checked in CI) |
 | Recovery from full node loss | < 30 seconds | Not yet measured |
 
@@ -315,7 +319,8 @@ make dev-api
 make dev-scheduler
 SLUICE_WEBHOOK_ALLOW_PRIVATE=true make dev-worker
 
-# Dashboard (uses dev-token unless NEXT_PUBLIC_API_TOKEN is set)
+# Dashboard: sign in with a tenant API key. Set NEXT_PUBLIC_API_URL if the API
+# isn't at http://localhost:8080.
 cd web && npm install && npm run dev
 ```
 

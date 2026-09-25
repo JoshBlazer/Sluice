@@ -1,6 +1,7 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useAuth } from "@/lib/auth";
 
 const LINKS = [
   { href: "/", label: "Queue" },
@@ -11,6 +12,7 @@ const LINKS = [
 
 export function NavBar() {
   const pathname = usePathname();
+  const { signOut } = useAuth();
   const isActive = (href: string) =>
     href === "/" ? pathname === "/" : pathname.startsWith(href);
 
@@ -33,6 +35,12 @@ export function NavBar() {
           {label}
         </Link>
       ))}
+      <button
+        onClick={signOut}
+        className="ml-auto py-3.5 px-3 text-sm text-zinc-500 hover:text-zinc-200 transition-colors"
+      >
+        Sign out
+      </button>
     </nav>
   );
 }
