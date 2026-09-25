@@ -206,6 +206,11 @@ func (q *Queue) Pop(ctx context.Context, workerID string, tenants []TenantWeight
 		if remaining <= 0 {
 			return Item{}, nil
 		}
+		// go-redis blocks for whole seconds and logs a warning every time it
+		// rounds a shorter timeout up to 1s, so round it here instead.
+		if remaining < time.Second {
+			remaining = time.Second
+		}
 		if err := q.rdb.BLPop(ctx, remaining, wakeKey).Err(); err != nil && err != redis.Nil {
 			if ctx.Err() != nil {
 				return Item{}, ctx.Err()

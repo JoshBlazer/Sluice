@@ -56,7 +56,7 @@ Every request is signed with the tenant's secret using [Standard Webhooks](https
 | `webhook-timestamp` | Unix seconds when the request was sent |
 | `webhook-signature` | `v1,` + base64 HMAC-SHA256 of `{id}.{timestamp}.{body}` |
 
-A job's own headers can't override these. Each tenant's signing secret (`whsec_…`) is shown by `sluice-cli create-tenant` and returned by `GET /v1/webhook-secret`. Verify requests with any [Standard Webhooks library](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries), for example in Node:
+A job's own headers can't override these. Requests also carry a W3C `traceparent` header (replacing any the job sets), so an OpenTelemetry-instrumented receiver joins the job's trace. Each tenant's signing secret (`whsec_…`) is shown by `sluice-cli create-tenant` and returned by `GET /v1/webhook-secret`. Verify requests with any [Standard Webhooks library](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries), for example in Node:
 
 ```js
 import { Webhook } from "standardwebhooks";

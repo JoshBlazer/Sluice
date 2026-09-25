@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/sluice/internal/job"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 const maxResponseDrain = 64 << 10
@@ -66,8 +67,10 @@ func newWebhookClient(allowPrivate bool) *http.Client {
 		}
 	}
 	// No client-wide timeout: each request gets its job's own timeout.
+	// otelhttp records the call as a child of the job's span and sends a W3C
+	// traceparent, so the receiver's own spans can join the job's trace.
 	return &http.Client{
-		Transport: &http.Transport{
+		Transport: otelhttp.NewTransport(&http.Transport{
 			// No proxy: a proxy would dial on our behalf and bypass the address check.
 			Proxy:                 nil,
 			DialContext:           dialer.DialContext,
@@ -76,7 +79,7 @@ func newWebhookClient(allowPrivate bool) *http.Client {
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: time.Second,
-		},
+		}),
 	}
 }
 
