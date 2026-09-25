@@ -86,3 +86,21 @@ func L(ctx context.Context) *slog.Logger {
 
 	return l
 }
+
+// TraceParent returns the W3C traceparent for the span active in ctx, or "" if
+// there is none. Stored with a job, it lets the job's execution join the trace
+// of the request that submitted it.
+func TraceParent(ctx context.Context) string {
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	return carrier.Get("traceparent")
+}
+
+// WithTraceParent returns ctx carrying the remote span described by a W3C
+// traceparent, so spans started from it continue that trace.
+func WithTraceParent(ctx context.Context, traceparent string) context.Context {
+	if traceparent == "" {
+		return ctx
+	}
+	return otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier{"traceparent": traceparent})
+}

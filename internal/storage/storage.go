@@ -51,15 +51,15 @@ func InsertJob(ctx context.Context, db *pgxpool.Pool, j *job.Job) error {
 		INSERT INTO jobs (
 			id, tenant_id, type, payload, priority, state,
 			run_at, attempt, max_retries, backoff_seconds,
-			idempotency_key, created_at
+			idempotency_key, created_at, trace_context
 		) VALUES (
 			$1, $2, $3, $4, $5, $6,
 			$7, $8, $9, $10,
-			$11, $12
+			$11, $12, $13
 		)`,
 		j.ID, j.TenantID, j.Type, []byte(j.Payload), j.Priority, string(j.State),
 		j.RunAt, j.Attempt, j.MaxRetries, j.BackoffSeconds,
-		j.IdempotencyKey, j.CreatedAt,
+		j.IdempotencyKey, j.CreatedAt, j.TraceParent,
 	)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -122,12 +122,12 @@ const claimSQL = `
 				SELECT id FROM jobs
 				WHERE id = $1 AND state = 'pending'
 				FOR UPDATE SKIP LOCKED)
-			RETURNING ` + jobColumns + `
+			RETURNING ` + jobColumns + `, trace_context
 		), run AS (
 			INSERT INTO job_runs (id, job_id, tenant_id, attempt, started_at, state)
 			SELECT $6, id, tenant_id, attempt, $2, 'running' FROM claimed
 		)
-		SELECT ` + jobColumns + ` FROM claimed`
+		SELECT ` + jobColumns + `, trace_context FROM claimed`
 
 // ErrConcurrencyLimit means the job's tenant already has max_concurrency jobs running.
 var ErrConcurrencyLimit = errors.New("tenant concurrency limit reached")
@@ -176,7 +176,7 @@ func claim(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, jobID uuid.UUID, workerID string, token uuid.UUID, deadline time.Time) (*job.Job, uuid.UUID, error) {
 	runID := uuid.New()
-	j, err := scanJob(q.QueryRow(ctx, claimSQL, jobID, time.Now(), workerID, token, deadline, runID))
+	j, err := scanJob(q.QueryRow(ctx, claimSQL, jobID, time.Now(), workerID, token, deadline, runID), &traceParentDest{})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, uuid.Nil, nil
 	}
@@ -531,17 +531,24 @@ func PromoteFailedToPending(ctx context.Context, db *pgxpool.Pool, jobID uuid.UU
 	return nil
 }
 
-func scanJob(row pgx.Row) (*job.Job, error) {
+// traceParentDest marks that the row has a trailing trace_context column
+// (only the claim statement returns it).
+type traceParentDest struct{}
+
+func scanJob(row pgx.Row, extra ...*traceParentDest) (*job.Job, error) {
 	var j job.Job
 	var payload []byte
 	var state string
-	err := row.Scan(
+	dest := []any{
 		&j.ID, &j.TenantID, &j.Type, &payload, &j.Priority, &state,
 		&j.RunAt, &j.ClaimedAt, &j.ClaimedBy, &j.ClaimToken, &j.Deadline,
 		&j.Attempt, &j.MaxRetries, &j.BackoffSeconds, &j.IdempotencyKey,
 		&j.LastError, &j.CreatedAt, &j.CompletedAt,
-	)
-	if err != nil {
+	}
+	if len(extra) > 0 {
+		dest = append(dest, &j.TraceParent)
+	}
+	if err := row.Scan(dest...); err != nil {
 		return nil, err
 	}
 	j.Payload = json.RawMessage(payload)
