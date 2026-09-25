@@ -1,0 +1,83 @@
+# Prometheus alerting rules for Sluice. The Helm chart renders these as a
+# PrometheusRule (monitoring.prometheusRule.enabled); with plain Prometheus, list
+# this file under rule_files. Thresholds are starting points: tune them to your
+# traffic.
+groups:
+  - name: sluice
+    rules:
+      - alert: SluiceNoSchedulerLeader
+        expr: sum(sluice_scheduler_is_leader) < 1 or absent(sluice_scheduler_is_leader)
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: No Sluice scheduler holds leadership
+          description: Scheduled jobs, retries, crash recovery and cron are stalled. Check scheduler pods and etcd.
+
+      - alert: SluiceMultipleSchedulerLeaders
+        expr: sum(sluice_scheduler_is_leader) > 1
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: More than one Sluice scheduler reports being leader
+          description: Safe for a moment (every scheduler task tolerates it), but persistent split brain points to etcd or network trouble.
+
+      - alert: SluiceQueueBacklogGrowing
+        expr: sum(sluice_queue_depth) > 1000 and deriv(sum(sluice_queue_depth)[10m:1m]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Sluice queue backlog is {{ $value | humanize }} jobs and growing"
+          description: Workers aren't keeping up. Scale workers or check for slow webhook endpoints.
+
+      - alert: SluiceHighJobFailureRate
+        expr: |
+          sum(rate(sluice_jobs_total{state=~"failed|dead"}[10m]))
+            / sum(rate(sluice_jobs_total[10m])) > 0.25
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of Sluice job attempts are failing"
+          description: Check last_error on recent jobs (Retries page) for a common cause.
+
+      - alert: SluiceJobsDeadLettering
+        expr: sum by (tenant_id) (increase(sluice_jobs_total{state="dead"}[15m])) > 0
+        labels: {severity: info}
+        annotations:
+          summary: "Tenant {{ $labels.tenant_id }} has jobs exhausting their retries"
+          description: Inspect and replay them from the Dead Letter page or sluice-cli list-dead.
+
+      - alert: SluiceAPIServerErrors
+        expr: |
+          sum(rate(sluice_http_request_duration_seconds_count{status=~"5.."}[5m]))
+            / sum(rate(sluice_http_request_duration_seconds_count[5m])) > 0.05
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of Sluice API requests are failing"
+          description: Check API logs and /readyz (Postgres and Redis connectivity).
+
+      - alert: SluiceSubmitLatencyHigh
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(
+            sluice_http_request_duration_seconds_bucket{method="POST", path="/v1/jobs"}[5m]))) > 0.5
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Sluice job submission p99 is {{ $value | humanizeDuration }}"
+          description: Usually Postgres is slow or the API's connection pool is exhausted.
+
+      - alert: SluiceTenantThrottled
+        expr: sum by (tenant_id) (rate(sluice_tenant_throttled_total[10m])) > 1
+        for: 15m
+        labels: {severity: info}
+        annotations:
+          summary: "Tenant {{ $labels.tenant_id }} is steadily at its concurrency limit"
+          description: Its jobs are queueing behind max_concurrency. Raise it with sluice-cli set-tenant-limits if intended.
+
+      - alert: SluiceTargetDown
+        expr: up{job=~"sluice.*"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Sluice {{ $labels.job }} target {{ $labels.instance }} is down"
+          description: Prometheus can't scrape this process.

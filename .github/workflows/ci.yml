@@ -49,7 +49,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
           cache: true
 
       - name: Build
@@ -57,6 +57,9 @@ jobs:
 
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
       - name: Vet
         run: go vet ./... && go vet -tags integration ./...
@@ -112,6 +115,8 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
       - run: npm run build
 
   kubernetes:
@@ -128,3 +133,14 @@ jobs:
           kind load docker-image sluice:ci --name sluice
       - name: Smoke test
         run: scripts/k8s-smoke.sh
+
+  monitoring:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check alert rules
+        run: docker run --rm -v "$PWD/deploy:/deploy" --entrypoint promtool prom/prometheus:v2.51.2 check rules /deploy/helm/files/alerts.yml
+      - name: Unit-test alert rules
+        run: docker run --rm -v "$PWD/deploy:/deploy" -w /deploy/monitoring --entrypoint promtool prom/prometheus:v2.51.2 test rules alerts_test.yml
+      - name: Lint OpenAPI spec
+        run: npx --yes @redocly/cli@1 lint internal/api/openapi.yaml

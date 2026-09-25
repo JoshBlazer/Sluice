@@ -1,0 +1,60 @@
+# promtool test rules deploy/monitoring/alerts_test.yml
+rule_files:
+  - ../helm/files/alerts.yml
+evaluation_interval: 1m
+tests:
+  - name: leader lost, then two leaders
+    interval: 1m
+    input_series:
+      - series: 'sluice_scheduler_is_leader{instance="a"}'
+        values: '1 0 0 0 1 1 1 1'
+      - series: 'sluice_scheduler_is_leader{instance="b"}'
+        values: '0 0 0 0 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SluiceNoSchedulerLeader
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: No Sluice scheduler holds leadership
+              description: Scheduled jobs, retries, crash recovery and cron are stalled. Check scheduler pods and etcd.
+      - eval_time: 7m
+        alertname: SluiceNoSchedulerLeader
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: SluiceMultipleSchedulerLeaders
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: More than one Sluice scheduler reports being leader
+              description: Safe for a moment (every scheduler task tolerates it), but persistent split brain points to etcd or network trouble.
+
+  - name: API 5xx ratio
+    interval: 1m
+    input_series:
+      - series: 'sluice_http_request_duration_seconds_count{method="POST",path="/v1/jobs",status="201"}'
+        values: '0+90x10'
+      - series: 'sluice_http_request_duration_seconds_count{method="POST",path="/v1/jobs",status="500"}'
+        values: '0+10x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SluiceAPIServerErrors
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "10% of Sluice API requests are failing"
+              description: Check API logs and /readyz (Postgres and Redis connectivity).
+
+  - name: healthy system raises nothing
+    interval: 1m
+    input_series:
+      - series: 'sluice_scheduler_is_leader{instance="a"}'
+        values: '1x10'
+      - series: 'sluice_http_request_duration_seconds_count{method="GET",path="/healthz",status="200"}'
+        values: '0+100x10'
+      - series: 'sluice_jobs_total{state="succeeded",tenant_id="t",type="webhook"}'
+        values: '0+100x10'
+    alert_rule_test:
+      - {eval_time: 10m, alertname: SluiceNoSchedulerLeader, exp_alerts: []}
+      - {eval_time: 10m, alertname: SluiceAPIServerErrors, exp_alerts: []}
+      - {eval_time: 10m, alertname: SluiceHighJobFailureRate, exp_alerts: []}
