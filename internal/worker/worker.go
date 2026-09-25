@@ -300,10 +300,6 @@ func (w *Worker) webhookSecret(ctx context.Context, tenantID uuid.UUID) (string,
 
 func (w *Worker) process(ctx context.Context, item queue.Item) bool {
 	jobID := item.JobID
-	tracer := telemetry.Tracer("sluice/worker")
-	ctx, span := tracer.Start(ctx, "worker.execute")
-	span.SetAttributes(attribute.String("job.id", jobID.String()))
-	defer span.End()
 	defer w.queue.RemoveFromProcessing(context.WithoutCancel(ctx), w.id, jobID) //nolint:errcheck
 
 	token := uuid.New()
@@ -327,7 +323,6 @@ func (w *Worker) process(ctx context.Context, item queue.Item) bool {
 	}
 	if err != nil {
 		telemetry.L(ctx).Error("claim failed", "job_id", jobID, "err", err)
-		span.RecordError(err)
 		// The job is out of Redis but still pending in Postgres. Put it back now
 		// rather than leave it for the reconciler, which only looks after a minute.
 		if err := w.queue.Requeue(context.WithoutCancel(ctx), item); err != nil {
@@ -339,7 +334,15 @@ func (w *Worker) process(ctx context.Context, item queue.Item) bool {
 		return true
 	}
 
+	// Execution continues the trace of the request that submitted the job, so one
+	// trace covers submission, queueing and every attempt.
+	if j.TraceParent != nil {
+		ctx = telemetry.WithTraceParent(ctx, *j.TraceParent)
+	}
+	ctx, span := telemetry.Tracer("sluice/worker").Start(ctx, "worker.execute")
+	defer span.End()
 	span.SetAttributes(
+		attribute.String("job.id", jobID.String()),
 		attribute.String("job.type", j.Type),
 		attribute.String("job.tenant_id", j.TenantID.String()),
 		attribute.Int("job.attempt", j.Attempt),

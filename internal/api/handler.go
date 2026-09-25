@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sluice/internal/job"
 	"github.com/sluice/internal/storage"
+	"github.com/sluice/internal/telemetry"
 	"github.com/sluice/internal/tenant"
 )
 
@@ -43,6 +44,9 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j.IdempotencyKey = req.IdempotencyKey
+	if tp := telemetry.TraceParent(r.Context()); tp != "" {
+		j.TraceParent = &tp
+	}
 	if req.RunAt != nil && req.RunAt.After(now) {
 		j.RunAt = *req.RunAt
 		j.State = job.StateScheduled

@@ -56,6 +56,9 @@ type Job struct {
 	LastError      *string         `json:"last_error,omitempty"`
 	CreatedAt      time.Time       `json:"created_at"`
 	CompletedAt    *time.Time      `json:"completed_at,omitempty"`
+	// TraceParent is the W3C traceparent of the submitting request, so the job's
+	// execution joins that distributed trace. Set on insert and returned by claims.
+	TraceParent *string `json:"-"`
 }
 
 func (j *Job) IsTerminal() bool {
