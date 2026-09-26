@@ -3,7 +3,9 @@
   "image": "mcr.microsoft.com/devcontainers/go:1.27-bookworm",
   "features": {
     "ghcr.io/devcontainers/features/node:1": { "version": "24" },
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    // Lets `gh codespace ssh` and `gh codespace logs` reach the container.
+    "ghcr.io/devcontainers/features/sshd:1": {}
   },
   "hostRequirements": { "cpus": 2, "memory": "8gb" },
   // The dashboard proxies the API through its own origin, so the browser only

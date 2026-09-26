@@ -21,6 +21,8 @@ NODE_TYPE=${NODE_TYPE:-cpx31} # 4 vCPU / 8 GB: the README's target node
 DB_TYPE=${DB_TYPE:-ccx33}     # 8 dedicated vCPU / 32 GB, so the database isn't what's measured
 LOAD_TYPE=${LOAD_TYPE:-cpx41} # 8 vCPU / 16 GB, so the load generator isn't either
 OS_IMAGE=${OS_IMAGE:-docker-ce} # Hetzner's Ubuntu image with Docker preinstalled
+# Same as run.sh; add e.g. "-i ~/.ssh/other_key" to use a key other than your default.
+read -r -a SSH_OPTS <<< "${SSH_OPTS:--o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10}"
 
 case ${1:-} in
 up)
@@ -49,7 +51,7 @@ up)
     private=$(hcloud server describe "$name" -o format='{{ (index .PrivateNet 0).IP }}')
     echo "$role root@$public $private" >> hosts.txt
     for _ in $(seq 1 60); do
-      ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5 "root@$public" \
+      ssh "${SSH_OPTS[@]}" "root@$public" \
         'cloud-init status --wait > /dev/null 2>&1; command -v vmstat > /dev/null' && break
       sleep 5
     done
