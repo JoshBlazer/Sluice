@@ -53,7 +53,7 @@ jobs:
             org.opencontainers.image.version=${{ steps.v.outputs.version }}
             org.opencontainers.image.licenses=MIT
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
 
       - name: Package Helm chart
         run: helm package deploy/helm --version "${{ steps.v.outputs.version }}" --app-version "${{ steps.v.outputs.version }}" -d dist
