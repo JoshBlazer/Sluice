@@ -45,7 +45,7 @@ jobs:
           --health-retries 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -81,7 +81,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build image
         run: docker build -t sluice:ci --build-arg VERSION=ci .
       - name: Smoke test binaries
@@ -95,7 +95,7 @@ jobs:
   helm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v4
       - name: Lint chart
         run: helm lint deploy/helm
@@ -108,7 +108,7 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -123,7 +123,7 @@ jobs:
     # Installs the Helm chart on a throwaway kind cluster and runs a job through it.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: helm/kind-action@v1
         with:
           cluster_name: sluice
@@ -137,7 +137,7 @@ jobs:
   monitoring:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check alert rules
         run: docker run --rm -v "$PWD/deploy:/deploy" --entrypoint promtool prom/prometheus:v2.51.2 check rules /deploy/helm/files/alerts.yml
       - name: Unit-test alert rules
